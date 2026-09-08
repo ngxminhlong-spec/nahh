@@ -5,7 +5,7 @@ on:
   push:
     paths:
       - 'ipas/*.ipa'
-  # Vẫn giữ lại nút bấm thủ công nếu thỉnh thoảng bạn muốn chạy bằng link URL
+  # Vẫn giữ nút bấm thủ công trên web nếu bạn muốn truyền link trực tiếp
   workflow_dispatch:
     inputs:
       ipa_url:
@@ -32,12 +32,12 @@ jobs:
       - name: Get Source IPA (From push folder or URL)
         run: |
           mkdir -p public
-          # Kiểm tra nếu chạy bằng push file lên thư mục ipas/
+          # Kiểm tra nếu đẩy file trực tiếp vào thư mục ipas/
           if [ -d "ipas" ] && ls ipas/*.ipa 1> /dev/null 2>&1; then
             LOCAL_IPA=$(ls ipas/*.ipa | head -n 1)
             echo "Phát hiện file IPA trong kho: $LOCAL_IPA"
             cp "$LOCAL_IPA" app.unsafe.ipa
-          # Nếu chạy bằng nút bấm thủ công và điền URL
+          # Nếu chạy thủ công bằng cách nhập URL
           elif [ -n "${{ github.event.inputs.ipa_url }}" ]; then
             echo "Đang tải IPA từ URL..."
             curl -L "${{ github.event.inputs.ipa_url }}" -o app.unsafe.ipa
@@ -46,24 +46,26 @@ jobs:
             exit 1
           fi
 
-      - name: Sign IPA with Apple ID (Interactive 2FA Support)
+      - name: Sign IPA with Apple ID
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
         run: |
-          echo "Bắt đầu tiến trình đăng nhập và ký app..."
-          # Mô phỏng quá trình ký thành công ra file signed
+          echo "Bắt đầu tiến trình đăng nhập và ký ứng dụng..."
+          # Thực hiện các câu lệnh ký app tại đây (dùng zsign hoặc công cụ tương thích)
+          # Mô phỏng quá trình ký thành công ra file signed:
           mv app.unsafe.ipa app.signed.ipa
 
-      - name: Prepare OTA Web Assets
+      - name: Prepare OTA Web Assets & Backup Download
         run: |
+          # Đưa file IPA đã ký vào thư mục public để làm link tải dự phòng
           mv app.signed.ipa public/app.ipa
           
           REPO_NAME="${{ github.event.repository.name }}"
           USER_NAME="${{ github.repository_owner }}"
           BASE_URL="https://$USER_NAME.github.io/$REPO_NAME"
 
-          # Tạo manifest.plist chuẩn OTA
+          # Tạo file manifest.plist chuẩn OTA
           cat <<EOF > public/manifest.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -97,7 +99,7 @@ jobs:
           </plist>
           EOF
 
-          # Tạo file index.html giao diện OTA
+          # Tạo giao diện index.html có cả nút OTA và nút tải IPA dự phòng
           cat <<EOF > public/index.html
           <!DOCTYPE html>
           <html lang="vi">
@@ -106,17 +108,22 @@ jobs:
               <meta name="viewport" content="width=device-width, initial-scale=1.0">
               <title>OTA App Installer</title>
               <style>
-                  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; text-align: center; padding-top: 80px; background: #000; color: #fff; }
-                  .card { background: #1c1c1e; display: inline-block; padding: 40px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-                  .btn { background: #0a84ff; color: white; padding: 15px 35px; font-size: 18px; border: none; border-radius: 14px; text-decoration: none; display: inline-block; font-weight: bold; margin-top: 20px; }
+                  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; text-align: center; padding-top: 60px; background: #000; color: #fff; }
+                  .card { background: #1c1c1e; display: inline-block; padding: 30px; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); max-width: 90%; }
+                  .btn { background: #0a84ff; color: white; padding: 14px 25px; font-size: 16px; border: none; border-radius: 12px; text-decoration: none; display: block; font-weight: bold; margin-top: 15px; }
+                  .btn-alt { background: #323236; }
                   .btn:active { opacity: 0.8; }
+                  p { color: #8e8e93; font-size: 14px; }
               </style>
           </head>
           <body>
               <div class="card">
-                  <h2>Cài đặt ứng dụng qua OTA</h2>
-                  <p>Bấm bên dưới để cài trực tiếp qua Safari:</p>
-                  <a class="btn" href="itms-services://?action=download-manifest&url=$BASE_URL/manifest.plist">Cài đặt ngay</a>
+                  <h2>Cài đặt ứng dụng</h2>
+                  <p>Trang web OTA tự động cho iPhone</p>
+                  
+                  <a class="btn" href="itms-services://?action=download-manifest&url=$BASE_URL/manifest.plist">Cài đặt trực tiếp qua OTA</a>
+                  
+                  <a class="btn btn-alt" href="$BASE_URL/app.ipa">Tải file .ipa dự phòng</a>
               </div>
           </body>
           </html>
