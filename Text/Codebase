@@ -1,0 +1,7358 @@
+fold.lua
+
+local Fold = {}
+
+local ARITH = {
+  ["+"]  = function(a, b) return a + b end,
+  ["-"]  = function(a, b) return a - b end,
+  ["*"]  = function(a, b) return a * b end,
+  ["/"]  = function(a, b) return a / b end,
+  ["%"]  = function(a, b) return a % b end,
+  ["^"]  = function(a, b) return a ^ b end,
+  [".."] = function(a, b) return tostring(a) .. tostring(b) end,
+}
+
+local foldExpr, foldStat, foldBlock
+
+function foldExpr(node)
+  local kind = node.kind
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+    or kind == "False" or kind == "Vararg" or kind == "Name" then
+    return node
+  elseif kind == "Index" then
+    node.obj = foldExpr(node.obj)
+    node.key = foldExpr(node.key)
+    return node
+  elseif kind == "Paren" then
+    node.expr = foldExpr(node.expr)
+    -- Nếu bên trong Paren chỉ là hằng số đơn thuần, tháo bọc Paren
+    local innerKind = node.expr.kind
+    if innerKind == "Number" or innerKind == "String" or innerKind == "True" or innerKind == "False" or innerKind == "Nil" then
+      return node.expr
+    end
+    return node
+  elseif kind == "Table" then
+    for _, field in ipairs(node.fields) do
+      if field.type == "keyed" then field.key = foldExpr(field.key) end
+      field.value = foldExpr(field.value)
+    end
+    return node
+  elseif kind == "Function" then
+    node.body = foldBlock(node.body)
+    return node
+  elseif kind == "Call" then
+    node.fn = foldExpr(node.fn)
+    for i, a in ipairs(node.args) do node.args[i] = foldExpr(a) end
+    return node
+  elseif kind == "MethodCall" then
+    node.obj = foldExpr(node.obj)
+    for i, a in ipairs(node.args) do node.args[i] = foldExpr(a) end
+    return node
+  elseif kind == "Binop" then
+    node.lhs = foldExpr(node.lhs)
+    node.rhs = foldExpr(node.rhs)
+
+    -- 1. Nối chuỗi String .. String hoặc Number .. String
+    if node.op == ".." then
+      if (node.lhs.kind == "String" or node.lhs.kind == "Number") and
+         (node.rhs.kind == "String" or node.rhs.kind == "Number") then
+        return { kind = "String", value = tostring(node.lhs.value) .. tostring(node.rhs.value), line = node.line }
+      end
+    end
+
+    -- 2. Phép toán số học (Arithmetic)
+    local fn = ARITH[node.op]
+    if fn and node.lhs.kind == "Number" and node.rhs.kind == "Number" then
+      local ok, result = pcall(fn, node.lhs.value, node.rhs.value)
+      if ok and type(result) == "number" and result == result
+        and result ~= math.huge and result ~= -math.huge then
+        return { kind = "Number", value = result, line = node.line }
+      end
+    end
+
+    -- 3. Phép so sánh hằng số (Comparison)
+    if node.lhs.kind == node.rhs.kind and (node.lhs.kind == "Number" or node.lhs.kind == "String") then
+      if node.op == "==" then return { kind = node.lhs.value == node.rhs.value and "True" or "False", line = node.line } end
+      if node.op == "~=" then return { kind = node.lhs.value ~= node.rhs.value and "True" or "False", line = node.line } end
+    end
+
+    return node
+  elseif kind == "Unop" then
+    node.operand = foldExpr(node.operand)
+    
+    -- Số âm: -Number
+    if node.op == "-" and node.operand.kind == "Number" then
+      return { kind = "Number", value = -node.operand.value, line = node.line }
+    end
+    
+    -- Phủ định Logic: not True / not False
+    if node.op == "not" then
+      if node.operand.kind == "True" then return { kind = "False", line = node.line } end
+      if node.operand.kind == "False" then return { kind = "True", line = node.line } end
+      if node.operand.kind == "Nil" then return { kind = "True", line = node.line } end
+      if node.operand.kind == "Number" or node.operand.kind == "String" then return { kind = "False", line = node.line } end
+    end
+
+    -- Độ dài chuỗi: #String
+    if node.op == "#" and node.operand.kind == "String" then
+      return { kind = "Number", value = #node.operand.value, line = node.line }
+    end
+
+    return node
+  else
+    error("XenonSec fold: unknown expression kind '" .. tostring(kind) .. "'")
+  end
+end
+
+function foldStat(node)
+  local kind = node.kind
+  if kind == "Local" then
+    for i, v in ipairs(node.values) do node.values[i] = foldExpr(v) end
+  elseif kind == "LocalFunction" then
+    node.func = foldExpr(node.func)
+  elseif kind == "Assign" then
+    for i, v in ipairs(node.values) do node.values[i] = foldExpr(v) end
+    for _, tgt in ipairs(node.targets) do
+      if tgt.kind == "Index" then
+        tgt.obj = foldExpr(tgt.obj)
+        tgt.key = foldExpr(tgt.key)
+      end
+    end
+  elseif kind == "ExprStat" then
+    node.expr = foldExpr(node.expr)
+  elseif kind == "Do" then
+    node.body = foldBlock(node.body)
+  elseif kind == "If" then
+    for _, clause in ipairs(node.clauses) do
+      clause.cond = foldExpr(clause.cond)
+      clause.body = foldBlock(clause.body)
+    end
+    if node.elseBody then node.elseBody = foldBlock(node.elseBody) end
+  elseif kind == "While" then
+    node.cond = foldExpr(node.cond)
+    node.body = foldBlock(node.body)
+  elseif kind == "Repeat" then
+    node.body = foldBlock(node.body)
+    node.cond = foldExpr(node.cond)
+  elseif kind == "Break" or kind == "Continue" then
+    -- Nothing
+  elseif kind == "NumericFor" then
+    node.start = foldExpr(node.start)
+    node.limit = foldExpr(node.limit)
+    if node.step then node.step = foldExpr(node.step) end
+    node.body = foldBlock(node.body)
+  elseif kind == "GenericFor" then
+    for i, e in ipairs(node.exprs) do node.exprs[i] = foldExpr(e) end
+    node.body = foldBlock(node.body)
+  elseif kind == "Return" then
+    for i, a in ipairs(node.args) do node.args[i] = foldExpr(a) end
+  else
+    error("XenonSec fold: unknown statement kind '" .. tostring(kind) .. "'")
+  end
+  return node
+end
+
+function foldBlock(block)
+  for i, stat in ipairs(block.body) do block.body[i] = foldStat(stat) end
+  return block
+end
+
+function Fold.apply(ast)
+  return foldBlock(ast)
+end
+
+return Fold
+obfuscate.lualocal scriptDir = (debug.getinfo(1, "S").source:match("@?(.*/)") or "./")
+
+local function req(name) return dofile(scriptDir .. name) end
+
+
+
+local Parser = req("parser.lua")
+
+local Fold = req("fold.lua")
+
+local SSA = req("ssa.lua")
+
+local Localize = req("localize.lua")
+
+local Renamer = req("renamer.lua")
+
+local Capture = req("capture.lua")
+
+local Compiler = req("compiler.lua")
+
+local Junk = req("junk.lua")
+
+
+
+math.randomseed(os.time() + (tonumber(tostring({}):match("0x(%x+)"), 16) or 0))
+
+for _ = 1, 8 do math.random() end
+
+
+
+local ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+
+local function randomIdent(len)
+
+  len = len or (6 + math.random(0, 5))
+
+  local chars = {}
+
+  for i = 1, len do
+
+    local idx = math.random(1, #ALPHABET)
+
+    chars[i] = ALPHABET:sub(idx, idx)
+
+  end
+
+  return "_" .. table.concat(chars)
+
+end
+
+
+
+local function shuffledRange(n)
+
+  local t = {}
+
+  for i = 1, n do t[i] = i end
+
+  for i = n, 2, -1 do
+
+    local j = math.random(1, i)
+
+    t[i], t[j] = t[j], t[i]
+
+  end
+
+  return t
+
+end
+
+
+
+local function randomByteKey(len)
+
+  local bytes = {}
+
+  for i = 1, len do bytes[i] = math.random(1, 255) end
+
+  return bytes
+
+end
+
+
+
+local function byteXor(a, b)
+
+  local result, bit, x, y = 0, 1, a, b
+
+  while x > 0 or y > 0 do
+
+    local xb, yb = x % 2, y % 2
+
+    if xb ~= yb then result = result + bit end
+
+    x = (x - xb) / 2
+
+    y = (y - yb) / 2
+
+    bit = bit * 2
+
+  end
+
+  return result
+
+end
+
+
+
+local function rc4Ksa(key)
+
+  local S = {}
+
+  for i = 0, 255 do S[i] = i end
+
+  local j = 0
+
+  local keylen = #key
+
+  for i = 0, 255 do
+
+    j = (j + S[i] + key[(i % keylen) + 1]) % 256
+
+    S[i], S[j] = S[j], S[i]
+
+  end
+
+  return S
+
+end
+
+
+
+local function rc4Crypt(data, key)
+
+  local S = rc4Ksa(key)
+
+  local i, j = 0, 0
+
+  local out = {}
+
+  for n = 1, #data do
+
+    i = (i + 1) % 256
+
+    j = (j + S[i]) % 256
+
+    S[i], S[j] = S[j], S[i]
+
+    local K = S[(S[i] + S[j]) % 256]
+
+    out[n] = string.char(byteXor(data:byte(n), K))
+
+  end
+
+  return table.concat(out)
+
+end
+
+
+
+local SEED_MOD, LCG_MULT, LCG_ADD = 16777216, 2654435, 12345
+
+
+
+local function deriveSeed(key)
+
+  local seed = 2166136261 % SEED_MOD
+
+  for i = 1, #key do
+
+    seed = byteXor(seed, key[i])
+
+    seed = (seed * LCG_MULT + LCG_ADD) % SEED_MOD
+
+  end
+
+  return seed
+
+end
+
+
+
+local function lcgNext(seed)
+
+  seed = (seed * LCG_MULT + LCG_ADD) % SEED_MOD
+
+  return seed, math.floor(seed / 65536) % 256
+
+end
+
+
+
+local function rotl8(b, n)
+
+  n = n % 8
+
+  if n == 0 then return b end
+
+  return ((b * (2 ^ n)) % 256) + math.floor(b / (2 ^ (8 - n)))
+
+end
+
+local function rotr8(b, n) return rotl8(b, 8 - (n % 8)) end
+
+
+
+local function diffuseEncrypt(data, key)
+
+  local seed = deriveSeed(key)
+
+  local out = {}
+
+  for i = 1, #data do
+
+    local kbyte
+
+    seed, kbyte = lcgNext(seed)
+
+    local b = byteXor(data:byte(i), kbyte)
+
+    out[i] = string.char(rotl8(b, (i % 5) + 1))
+
+  end
+
+  return table.concat(out)
+
+end
+
+
+
+local function diffuseDecrypt(data, key)
+
+  local seed = deriveSeed(key)
+
+  local out = {}
+
+  for i = 1, #data do
+
+    local kbyte
+
+    seed, kbyte = lcgNext(seed)
+
+    local b = rotr8(data:byte(i), (i % 5) + 1)
+
+    out[i] = string.char(byteXor(b, kbyte))
+
+  end
+
+  return table.concat(out)
+
+end
+
+
+
+local function deriveIV(key)
+
+  local iv = 0
+
+  for i = 1, #key do iv = byteXor(iv, key[i]) end
+
+  return iv
+
+end
+
+
+
+local function cfbChain(data, iv)
+
+  local out, prev = {}, iv
+
+  for i = 1, #data do
+
+    local c = byteXor(data:byte(i), prev)
+
+    out[i] = string.char(c)
+
+    prev = c
+
+  end
+
+  return table.concat(out)
+
+end
+
+
+
+local function cfbUnchain(data, iv)
+
+  local out, prev = {}, iv
+
+  for i = 1, #data do
+
+    local c = data:byte(i)
+
+    out[i] = string.char(byteXor(c, prev))
+
+    prev = c
+
+  end
+
+  return table.concat(out)
+
+end
+
+
+
+local function cipherEncrypt(plaintext, key)
+
+  local a = rc4Crypt(plaintext, key)
+
+  local b = diffuseEncrypt(a, key)
+
+  local c = cfbChain(b, deriveIV(key))
+
+  return c
+
+end
+
+
+
+local function cipherDecrypt(ciphertext, key)
+
+  local b = cfbUnchain(ciphertext, deriveIV(key))
+
+  local a = diffuseDecrypt(b, key)
+
+  local plaintext = rc4Crypt(a, key)
+
+  return plaintext
+
+end
+
+
+
+local OPCODES = {
+
+  "LOADK", "LOADNIL", "LOADTRUE", "LOADFALSE", "GETVAR", "SETVAR", "DECLLOCAL",
+
+  "NEWTABLE", "GETINDEX", "SETINDEX", "SETLIST", "DUP", "SWAP", "POP",
+
+  "BINOP", "UNOP", "JMP", "JMPIFNOT", "JMPIFNIL", "TESTANDJMP", "TESTORJMP",
+
+  "CLOSURE", "NEWSCOPE", "POPSCOPE", "VARARGONE", "VARARGMULTI",
+
+  "ADJUSTMULTI", "CALL", "RETURN", "GETREG", "SETREG", "CPLX",
+
+}
+
+
+
+local CONST_REF_OPS = {
+
+  LOADK = true, GETVAR = true, SETVAR = true, DECLLOCAL = true,
+
+}
+
+
+
+local BINOP_SYMBOLS = { "+", "-", "*", "/", "%", "^", "..", "==", "~=", "<", ">", "<=", ">=", "//" }
+
+local UNOP_SYMBOLS = { "-", "not", "#" }
+
+
+
+local function addConst(mod, value)
+
+  local key = type(value) .. ":" .. tostring(value)
+
+  local existing = mod.constIndex[key]
+
+  if existing then return existing end
+
+  mod.consts[#mod.consts + 1] = value
+
+  local idx = #mod.consts
+
+  mod.constIndex[key] = idx
+
+  return idx
+
+end
+
+
+
+local ENV_CHECK_NAMES = {
+
+  "print", "pairs", "ipairs", "type", "tostring", "tonumber", "pcall",
+
+  "xpcall", "error", "setmetatable", "rawget", "rawset", "rawequal",
+
+  "select", "next",
+
+}
+
+
+
+local function buildBundle(mod, opts)
+
+  opts = opts or {}
+
+  local decoyCount = opts.decoyConstants or (6 + math.random(0, 10))
+
+
+
+  for _, proto in ipairs(mod.protos) do
+
+    local paramIdx = {}
+
+    for i, pdesc in ipairs(proto.params) do
+
+      if pdesc.reg then
+
+        paramIdx[i] = { 0, pdesc.slot }
+
+      else
+
+        paramIdx[i] = { 1, addConst(mod, pdesc.name) }
+
+      end
+
+    end
+
+    proto.paramIdx = paramIdx
+
+  end
+
+
+
+  local envCheckIdx = {}
+
+  if opts.antiDebug then
+
+    for i, name in ipairs(ENV_CHECK_NAMES) do
+
+      envCheckIdx[i] = addConst(mod, name)
+
+    end
+
+  end
+
+
+
+  local watermarkIdx = addConst(mod, "Protected by XenonSec")
+
+
+
+  for _ = 1, decoyCount do
+
+    if math.random() < 0.5 then
+
+      mod.consts[#mod.consts + 1] = randomIdent(4 + math.random(0, 12))
+
+    else
+
+      mod.consts[#mod.consts + 1] = math.random(-100000, 100000) + (math.random() * 0.0)
+
+    end
+
+  end
+
+
+
+  local n = #mod.consts
+
+  local perm = shuffledRange(n)
+
+  local shuffledConsts = {}
+
+  for oldIdx = 1, n do shuffledConsts[perm[oldIdx]] = mod.consts[oldIdx] end
+
+
+
+  for _, proto in ipairs(mod.protos) do
+
+    for _, instr in ipairs(proto.code) do
+
+      if CONST_REF_OPS[instr.op] then
+
+        instr.a = perm[instr.a]
+
+      end
+
+    end
+
+    for _, pair in ipairs(proto.paramIdx) do
+
+      if pair[1] == 1 then pair[2] = perm[pair[2]] end
+
+    end
+
+  end
+
+
+
+  for i, oldIdx in ipairs(envCheckIdx) do envCheckIdx[i] = perm[oldIdx] end
+
+  watermarkIdx = perm[watermarkIdx]
+
+
+
+  local opNums = shuffledRange(#OPCODES)
+
+  local OPNUM = {}
+
+  for i, name in ipairs(OPCODES) do OPNUM[name] = opNums[i] end
+
+
+
+  local binNums = shuffledRange(#BINOP_SYMBOLS)
+
+  local BINNUM = {}
+
+  for i, sym in ipairs(BINOP_SYMBOLS) do BINNUM[sym] = binNums[i] end
+
+
+
+  local unNums = shuffledRange(#UNOP_SYMBOLS)
+
+  local UNNUM = {}
+
+  for i, sym in ipairs(UNOP_SYMBOLS) do UNNUM[sym] = unNums[i] end
+
+
+
+  local key = randomByteKey(12 + math.random(0, 8))
+
+  local maskA = math.random(-999999, 999999)
+
+  local cipherConsts = {}
+
+  for i, v in ipairs(shuffledConsts) do
+
+    local tagged
+
+    if type(v) == "number" then
+
+      tagged = "N" .. tostring(v + maskA)
+
+    else
+
+      tagged = "S" .. v
+
+    end
+
+    cipherConsts[i] = cipherEncrypt(tagged, key)
+
+  end
+
+
+
+  local function mixChecksum(h, n) return (h * 31 + (n or 0)) % 2147483647 end
+
+  local checksum = 5381
+
+  for _, c in ipairs(cipherConsts) do
+
+    for i = 1, #c do checksum = mixChecksum(checksum, c:byte(i)) end
+
+  end
+
+
+
+  local protoLits = {}
+
+  for _, proto in ipairs(mod.protos) do
+
+    checksum = mixChecksum(checksum, proto.hasVararg and 1 or 0)
+
+    local codeParts = {}
+
+    for _, instr in ipairs(proto.code) do
+
+      local opn = OPNUM[instr.op]
+
+      local a
+
+      if instr.op == "BINOP" then
+
+        a = BINNUM[instr.a]
+
+      elseif instr.op == "UNOP" then
+
+        a = UNNUM[instr.a]
+
+      else
+
+        a = instr.a or 0
+
+      end
+
+      local b = instr.b or 0
+
+      local c = instr.c or 0
+
+      checksum = mixChecksum(checksum, opn)
+
+      checksum = mixChecksum(checksum, a)
+
+      checksum = mixChecksum(checksum, b)
+
+      checksum = mixChecksum(checksum, c)
+
+      codeParts[#codeParts + 1] = string.format("{%d,%s,%s,%s}", opn, tostring(a), tostring(b), tostring(c))
+
+    end
+
+    local paramParts = {}
+
+    for _, pair in ipairs(proto.paramIdx) do
+
+      checksum = mixChecksum(checksum, pair[1])
+
+      checksum = mixChecksum(checksum, pair[2])
+
+      paramParts[#paramParts + 1] = string.format("{%d,%d}", pair[1], pair[2])
+
+    end
+
+    protoLits[#protoLits + 1] = string.format(
+
+      "{p={%s},v=%s,c={%s}}",
+
+      table.concat(paramParts, ","),
+
+      proto.hasVararg and "true" or "false",
+
+      table.concat(codeParts, ",")
+
+    )
+
+  end
+
+
+
+  return {
+
+    cipherConsts = cipherConsts,
+
+    key = key,
+
+    maskA = maskA,
+
+    protoLits = protoLits,
+
+    mainProto = mod.mainProto,
+
+    OPNUM = OPNUM,
+
+    BINNUM = BINNUM,
+
+    UNNUM = UNNUM,
+
+    checksum = checksum,
+
+    envCheckIdx = envCheckIdx,
+
+    watermarkIdx = watermarkIdx,
+
+  }
+
+end
+
+
+
+local VM_TEMPLATE = [===[
+
+local %unpack% = table.unpack or unpack
+
+local %byte% = string.byte
+
+local %char% = string.char
+
+local %concat% = table.concat
+
+
+
+local function %bxor%(%a%, %b%)
+
+  local %r%, %bit%, %x%, %y% = 0, 1, %a%, %b%
+
+  while %x% > 0 or %y% > 0 do
+
+    local %xb%, %yb% = %x% % 2, %y% % 2
+
+    if %xb% ~= %yb% then %r% = %r% + %bit% end
+
+    %x% = (%x% - %xb%) / 2
+
+    %y% = (%y% - %yb%) / 2
+
+    %bit% = %bit% * 2
+
+  end
+
+  return %r%
+
+end
+
+
+
+local function %decode%(%s%, %k%)
+
+  local %out%, %kl% = {}, #%k%
+
+  for %i% = 1, #%s% do
+
+    %out%[%i%] = %char%(%bxor%(%byte%(%s%, %i%), %k%[((%i% - 1) % %kl%) + 1]))
+
+  end
+
+  return %concat%(%out%)
+
+end
+
+
+
+local function %pack%(...)
+
+  return { n = select("#", ...), ... }
+
+end
+
+
+
+local function %truthy%(%v%) return %v% ~= nil and %v% ~= false end
+
+
+
+local %BINOPS% = {
+
+  [%BN_PLUS%] = function(%a%, %b%) return %a% + %b% end,
+
+  [%BN_MINUS%] = function(%a%, %b%) return %a% - %b% end,
+
+  [%BN_MUL%] = function(%a%, %b%) return %a% * %b% end,
+
+  [%BN_DIV%] = function(%a%, %b%) return %a% / %b% end,
+
+  [%BN_MOD%] = function(%a%, %b%) return %a% % %b% end,
+
+  [%BN_POW%] = function(%a%, %b%) return %a% ^ %b% end,
+
+  [%BN_CONCAT%] = function(%a%, %b%) return %a% .. %b% end,
+
+  [%BN_EQ%] = function(%a%, %b%) return %a% == %b% end,
+
+  [%BN_NE%] = function(%a%, %b%) return %a% ~= %b% end,
+
+  [%BN_LT%] = function(%a%, %b%) return %a% < %b% end,
+
+  [%BN_GT%] = function(%a%, %b%) return %a% > %b% end,
+
+  [%BN_LE%] = function(%a%, %b%) return %a% <= %b% end,
+
+  [%BN_GE%] = function(%a%, %b%) return %a% >= %b% end,
+
+  [%BN_IDIV%] = function(%a%, %b%) return math.floor(%a% / %b%) end,
+
+}
+
+local %UNOPS% = {
+
+  [%UN_UNM%] = function(%a%) return -%a% end,
+
+  [%UN_NOT%] = function(%a%) return not %a% end,
+
+  [%UN_LEN%] = function(%a%) return #%a% end,
+
+}
+
+
+
+local %NILV% = setmetatable({}, { __tostring = function() return "<xs-nil>" end })
+
+
+
+local %OP_LOADK%,%OP_LOADNIL%,%OP_LOADTRUE%,%OP_LOADFALSE%,%OP_GETVAR%,%OP_SETVAR%,%OP_DECLLOCAL%,
+
+      %OP_NEWTABLE%,%OP_GETINDEX%,%OP_SETINDEX%,%OP_SETLIST%,%OP_DUP%,%OP_SWAP%,%OP_POP%,
+
+      %OP_BINOP%,%OP_UNOP%,%OP_JMP%,%OP_JMPIFNOT%,%OP_JMPIFNIL%,%OP_TESTANDJMP%,%OP_TESTORJMP%,
+
+      %OP_CLOSURE%,%OP_NEWSCOPE%,%OP_POPSCOPE%,%OP_VARARGONE%,%OP_VARARGMULTI%,
+
+      %OP_ADJUSTMULTI%,%OP_CALL%,%OP_RETURN%,%OP_GETREG%,%OP_SETREG%,%OP_CPLX%
+
+  = %N_LOADK%,%N_LOADNIL%,%N_LOADTRUE%,%N_LOADFALSE%,%N_GETVAR%,%N_SETVAR%,%N_DECLLOCAL%,
+
+    %N_NEWTABLE%,%N_GETINDEX%,%N_SETINDEX%,%N_SETLIST%,%N_DUP%,%N_SWAP%,%N_POP%,
+
+    %N_BINOP%,%N_UNOP%,%N_JMP%,%N_JMPIFNOT%,%N_JMPIFNIL%,%N_TESTANDJMP%,%N_TESTORJMP%,
+
+    %N_CLOSURE%,%N_NEWSCOPE%,%N_POPSCOPE%,%N_VARARGONE%,%N_VARARGMULTI%,
+
+    %N_ADJUSTMULTI%,%N_CALL%,%N_RETURN%,%N_GETREG%,%N_SETREG%,%N_CPLX%
+
+
+
+local function %run%(%mod%, ...)
+
+  local %consts%, %protos%, %mainIdx% = %mod%[1], %mod%[2], %mod%[3]
+
+
+
+  local %runProto%
+
+  %runProto% = function(%protoIdx%, %callArgs%, %parentScope%)
+
+    local %proto% = %protos%[%protoIdx%]
+
+    local %code% = %proto%.c
+
+
+
+    local %scope% = { %varsField% = {}, %parentField% = %parentScope% }
+
+    local %regs% = {}
+
+    local %params% = %proto%.p
+
+    for %pi% = 1, #%params% do
+
+      local %pdesc% = %params%[%pi%]
+
+      local %pv% = %callArgs%[%pi%]
+
+      if %pdesc%[1] == 0 then
+
+        %regs%[%pdesc%[2]] = %pv%
+
+      else
+
+        %scope%.%varsField%[%consts%[%pdesc%[2]]] = (%pv% == nil) and %NILV% or %pv%
+
+      end
+
+    end
+
+    local %varargs% = nil
+
+    if %proto%.v then
+
+      local %nva% = (%callArgs%.n or #%callArgs%) - #%params%
+
+      if %nva% < 0 then %nva% = 0 end
+
+      local %va% = { n = %nva% }
+
+      for %vi% = 1, %nva% do %va%[%vi%] = %callArgs%[#%params% + %vi%] end
+
+      %varargs% = %va%
+
+    end
+
+
+
+    local function %lookup%(%name%)
+
+      local %s% = %scope%
+
+      while %s% do
+
+        if %s%.%varsField%[%name%] ~= nil then return %s% end
+
+        %s% = %s%.%parentField%
+
+      end
+
+      return nil
+
+    end
+
+
+
+    local %stack%, %sp% = {}, 0
+
+    local function %push%(%v%) %sp% = %sp% + 1; %stack%[%sp%] = %v% end
+
+    local function %pop%() local %v% = %stack%[%sp%]; %stack%[%sp%] = nil; %sp% = %sp% - 1; return %v% end
+
+    local function %peek%() return %stack%[%sp%] end
+
+
+
+    local function %mkClosure%(%pIdx%)
+
+      local %capturedScope% = %scope%
+
+      return function(...)
+
+        return %runProto%(%pIdx%, %pack%(...), %capturedScope%)
+
+      end
+
+    end
+
+
+
+    local %ip% = 1
+
+    local %probe% = 0
+
+    while true do
+
+      local %instr% = %code%[%ip%]
+
+      if not %instr% then return end
+
+      local %op% = %instr%[1]
+
+      %probe% = %probe% + 1
+
+
+
+      if %op% == %OP_LOADK% and %OPQ_LOADK% then
+
+        %push%(%consts%[%instr%[2]]); %ip% = %ip% + 1
+
+      elseif %op% == %OP_LOADNIL% and %OPQ_LOADNIL% then
+
+        %push%(nil); %ip% = %ip% + 1
+
+      elseif %op% == %OP_LOADTRUE% and %OPQ_LOADTRUE% then
+
+        %push%(true); %ip% = %ip% + 1
+
+      elseif %op% == %OP_LOADFALSE% and %OPQ_LOADFALSE% then
+
+        %push%(false); %ip% = %ip% + 1
+
+      elseif %op% == %OP_GETVAR% and %OPQ_GETVAR% then
+
+        local %nm% = %consts%[%instr%[2]]
+
+        local %sc% = %lookup%(%nm%)
+
+        if %sc% then
+
+          local %v% = %sc%.%varsField%[%nm%]
+
+          if %v% == %NILV% then %push%(nil) else %push%(%v%) end
+
+        else
+
+          %push%(_G[%nm%])
+
+        end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_SETVAR% and %OPQ_SETVAR% then
+
+        local %nm% = %consts%[%instr%[2]]
+
+        local %v% = %pop%()
+
+        local %sc% = %lookup%(%nm%)
+
+        if %sc% then
+
+          %sc%.%varsField%[%nm%] = (%v% == nil) and %NILV% or %v%
+
+        else
+
+          _G[%nm%] = %v%
+
+        end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_DECLLOCAL% and %OPQ_DECLLOCAL% then
+
+        local %nm% = %consts%[%instr%[2]]
+
+        local %v% = %pop%()
+
+        %scope%.%varsField%[%nm%] = (%v% == nil) and %NILV% or %v%
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_GETREG% and %OPQ_GETREG% then
+
+        %push%(%regs%[%instr%[2]]); %ip% = %ip% + 1
+
+      elseif %op% == %OP_SETREG% and %OPQ_SETREG% then
+
+        %regs%[%instr%[2]] = %pop%(); %ip% = %ip% + 1
+
+      elseif %op% == %OP_CPLX% and %OPQ_CPLX% then
+
+        local %cxN% = (%instr%[2] or 3) % 7
+
+        local %cxAcc% = 0
+
+        for %cxI% = 1, %cxN% do
+
+          %cxAcc% = %cxAcc% + (%cxI% * %cxI%)
+
+          if (%cxAcc% % 2) == 0 then %cxAcc% = %cxAcc% - %cxI% else %cxAcc% = %cxAcc% + 0 end
+
+        end
+
+        local %cxTbl% = { %cxAcc%, %instr%[3] or 0 }
+
+        %push%(%cxTbl%[1] + %cxTbl%[2])
+
+        %pop%()
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_NEWTABLE% and %OPQ_NEWTABLE% then
+
+        %push%({}); %ip% = %ip% + 1
+
+      elseif %op% == %OP_GETINDEX% and %OPQ_GETINDEX% then
+
+        local %key% = %pop%(); local %obj% = %pop%()
+
+        %push%(%obj%[%key%]); %ip% = %ip% + 1
+
+      elseif %op% == %OP_SETINDEX% and %OPQ_SETINDEX% then
+
+        local %val% = %pop%(); local %key% = %pop%(); local %obj% = %pop%()
+
+        %obj%[%key%] = %val%; %ip% = %ip% + 1
+
+      elseif %op% == %OP_SETLIST% and %OPQ_SETLIST% then
+
+        local %base% = %instr%[2]
+
+        local %cnt% = %pop%()
+
+        local %arr% = {}
+
+        for %ii% = %cnt%, 1, -1 do %arr%[%ii%] = %pop%() end
+
+        local %tbl% = %pop%()
+
+        for %ii% = 1, %cnt% do %tbl%[%base% + %ii%] = %arr%[%ii%] end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_DUP% and %OPQ_DUP% then
+
+        %push%(%peek%()); %ip% = %ip% + 1
+
+      elseif %op% == %OP_SWAP% and %OPQ_SWAP% then
+
+        local %b2% = %pop%(); local %a2% = %pop%(); %push%(%b2%); %push%(%a2%); %ip% = %ip% + 1
+
+      elseif %op% == %OP_POP% and %OPQ_POP% then
+
+        for %ii% = 1, %instr%[2] do %pop%() end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_BINOP% and %OPQ_BINOP% then
+
+        local %b3% = %pop%(); local %a3% = %pop%()
+
+        %push%(%BINOPS%[%instr%[2]](%a3%, %b3%))
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_UNOP% and %OPQ_UNOP% then
+
+        local %a4% = %pop%()
+
+        %push%(%UNOPS%[%instr%[2]](%a4%))
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_JMP% and %OPQ_JMP% then
+
+        %ip% = %instr%[2]
+
+      elseif %op% == %OP_JMPIFNOT% and %OPQ_JMPIFNOT% then
+
+        local %v2% = %pop%()
+
+        if %truthy%(%v2%) then %ip% = %ip% + 1 else %ip% = %instr%[2] end
+
+      elseif %op% == %OP_JMPIFNIL% and %OPQ_JMPIFNIL% then
+
+        local %v3% = %pop%()
+
+        if %v3% == nil then %ip% = %instr%[2] else %ip% = %ip% + 1 end
+
+      elseif %op% == %OP_TESTANDJMP% and %OPQ_TESTANDJMP% then
+
+        local %v4% = %peek%()
+
+        if %truthy%(%v4%) then %ip% = %ip% + 1 else %ip% = %instr%[2] end
+
+      elseif %op% == %OP_TESTORJMP% and %OPQ_TESTORJMP% then
+
+        local %v5% = %peek%()
+
+        if %truthy%(%v5%) then %ip% = %instr%[2] else %ip% = %ip% + 1 end
+
+      elseif %op% == %OP_CLOSURE% and %OPQ_CLOSURE% then
+
+        %push%(%mkClosure%(%instr%[2])); %ip% = %ip% + 1
+
+      elseif %op% == %OP_NEWSCOPE% and %OPQ_NEWSCOPE% then
+
+        %scope% = { %varsField% = {}, %parentField% = %scope% }; %ip% = %ip% + 1
+
+      elseif %op% == %OP_POPSCOPE% and %OPQ_POPSCOPE% then
+
+        %scope% = %scope%.%parentField%; %ip% = %ip% + 1
+
+      elseif %op% == %OP_VARARGONE% and %OPQ_VARARGONE% then
+
+        if %varargs% then %push%(%varargs%[1]) else %push%(nil) end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_VARARGMULTI% and %OPQ_VARARGMULTI% then
+
+        local %nv% = %varargs% and %varargs%.n or 0
+
+        for %vj% = 1, %nv% do %push%(%varargs%[%vj%]) end
+
+        %push%(%nv%)
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_ADJUSTMULTI% and %OPQ_ADJUSTMULTI% then
+
+        local %wn% = %instr%[2]
+
+        local %cnt2% = %pop%()
+
+        local %arr2% = {}
+
+        for %ii2% = %cnt2%, 1, -1 do %arr2%[%ii2%] = %pop%() end
+
+        for %ii2% = 1, %wn% do
+
+          if %ii2% <= %cnt2% then %push%(%arr2%[%ii2%]) else %push%(nil) end
+
+        end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_CALL% and %OPQ_CALL% then
+
+        local %nstatic%, %argKind%, %resMulti% = %instr%[2], %instr%[3], %instr%[4]
+
+        local %cargs%, %ntotal% = {}, 0
+
+        if %argKind% == 1 then
+
+          local %cnt3% = %pop%()
+
+          local %trail% = {}
+
+          for %ii3% = %cnt3%, 1, -1 do %trail%[%ii3%] = %pop%() end
+
+          local %fix% = {}
+
+          for %ii3% = %nstatic%, 1, -1 do %fix%[%ii3%] = %pop%() end
+
+          for %ii3% = 1, %nstatic% do %cargs%[%ii3%] = %fix%[%ii3%] end
+
+          for %ii3% = 1, %cnt3% do %cargs%[%nstatic% + %ii3%] = %trail%[%ii3%] end
+
+          %ntotal% = %nstatic% + %cnt3%
+
+        else
+
+          local %fix2% = {}
+
+          for %ii3% = %nstatic%, 1, -1 do %fix2%[%ii3%] = %pop%() end
+
+          %cargs% = %fix2%
+
+          %ntotal% = %nstatic%
+
+        end
+
+        local %fn% = %pop%()
+
+        local %results% = %pack%(%fn%(%unpack%(%cargs%, 1, %ntotal%)))
+
+        if %resMulti% == 1 then
+
+          for %ri% = 1, %results%.n do %push%(%results%[%ri%]) end
+
+          %push%(%results%.n)
+
+        else
+
+          %push%(%results%[1])
+
+        end
+
+        %ip% = %ip% + 1
+
+      elseif %op% == %OP_RETURN% and %OPQ_RETURN% then
+
+        local %nstatic2%, %argKind2% = %instr%[2], %instr%[3]
+
+        if %argKind2% == 1 then
+
+          local %cnt4% = %pop%()
+
+          local %trail2% = {}
+
+          for %ii4% = %cnt4%, 1, -1 do %trail2%[%ii4%] = %pop%() end
+
+          local %fix3% = {}
+
+          for %ii4% = %nstatic2%, 1, -1 do %fix3%[%ii4%] = %pop%() end
+
+          local %all% = {}
+
+          for %ii4% = 1, %nstatic2% do %all%[%ii4%] = %fix3%[%ii4%] end
+
+          for %ii4% = 1, %cnt4% do %all%[%nstatic2% + %ii4%] = %trail2%[%ii4%] end
+
+          return %unpack%(%all%, 1, %nstatic2% + %cnt4%)
+
+        else
+
+          local %vals% = {}
+
+          for %ii4% = %nstatic2%, 1, -1 do %vals%[%ii4%] = %pop%() end
+
+          return %unpack%(%vals%, 1, %nstatic2%)
+
+        end
+
+      %DECOY_BRANCHES%
+
+      else
+
+        error()
+
+      end
+
+    end
+
+  end
+
+
+
+  return %runProto%(%mainIdx%, %pack%(...), nil)
+
+end
+
+
+
+return %run%]===]
+
+
+
+local function substitute(template, resolve)
+
+  return (template:gsub("%%([%a_][%w_]*)%%", function(tok)
+
+    local v = resolve(tok)
+
+    assert(v ~= nil, "unresolved template placeholder %" .. tok .. "%")
+
+    return v
+
+  end))
+
+end
+
+
+
+local OPAQUE_IDENTITIES = {
+
+  "((V*V-V)%2==0)",
+
+  "(((V+1)*(V+1)-V*V-2*V-1)==0)",
+
+  "((V%2)*(V%2)==(V%2))",
+
+  "(((V*V)%4)~=2)",
+
+  "(((V-V)*(V+7))==0)",
+
+  "((V*3-V*2-V)==0)",
+
+  "(((V*V+V)%2)==0)",
+
+  "(((V*(V+1)*(V+2))%6)==0)",
+
+  "((((V*V*V)-V)%6)==0)",
+
+  "(((V+V)%2)==0)",
+
+  "((V*V)>=0)",
+
+  "((V==V))",
+
+  "(not (V~=V))",
+
+  "(((V*5-V*4-V))==0)",
+
+  "(((V*V-V*V))==0)",
+
+}
+
+
+
+local FALSE_IDENTITIES = {
+
+  "((V*V-V)%2==1)",
+
+  "(((V+1)*(V+1)-V*V-2*V-1)~=0)",
+
+  "(((V*V)%4)==2)",
+
+  "(((V-V)*(V+7))~=0)",
+
+  "((V*3-V*2-V)~=0)",
+
+  "(((V*V+V)%2)==1)",
+
+  "(((V*(V+1)*(V+2))%6)==1)",
+
+  "((V*V)<0)",
+
+  "((V~=V))",
+
+}
+
+
+
+local function genOpaquePredicate(probeName, depth)
+
+  local pool = {}
+
+  for i, v in ipairs(OPAQUE_IDENTITIES) do pool[i] = v end
+
+  local chosen = {}
+
+  for _ = 1, depth do
+
+    local idx = math.random(1, #pool)
+
+    chosen[#chosen + 1] = (pool[idx]:gsub("V", probeName))
+
+    table.remove(pool, idx)
+
+  end
+
+  local expr = chosen[#chosen]
+
+  for i = #chosen - 1, 1, -1 do
+
+    expr = "(" .. chosen[i] .. " and " .. expr .. ")"
+
+  end
+
+  return expr
+
+end
+
+
+
+local function genAlwaysFalsePredicate(probeName)
+
+  local falseIdx = math.random(1, #FALSE_IDENTITIES)
+
+  local trueIdx = math.random(1, #OPAQUE_IDENTITIES)
+
+  local f = (FALSE_IDENTITIES[falseIdx]:gsub("V", probeName))
+
+  local t = (OPAQUE_IDENTITIES[trueIdx]:gsub("V", probeName))
+
+  return "(" .. f .. " and " .. t .. ")"
+
+end
+
+
+
+local BINOP_TOKEN_NAMES = {
+
+  ["+"] = "PLUS", ["-"] = "MINUS", ["*"] = "MUL", ["/"] = "DIV",
+
+  ["%"] = "MOD", ["^"] = "POW", [".."] = "CONCAT",
+
+  ["=="] = "EQ", ["~="] = "NE", ["<"] = "LT", [">"] = "GT",
+
+  ["<="] = "LE", [">="] = "GE", ["//"] = "IDIV",
+
+}
+
+local UNOP_TOKEN_NAMES = { ["-"] = "UNM", ["not"] = "NOT", ["#"] = "LEN" }
+
+
+
+local function genDecoyBranches(ensureName, count)
+
+  local push, pop, peek = ensureName("push"), ensureName("pop"), ensureName("peek")
+
+  local stack, sp, ip = ensureName("stack"), ensureName("sp"), ensureName("ip")
+
+  local consts, instr = ensureName("consts"), ensureName("instr")
+
+  local probe = ensureName("probe")
+
+
+
+  local flavors = {
+
+    function()
+
+      return string.format(
+
+        "%s(%s(%s[1] or 0, 1)); %s = %s + 1",
+
+        push, "(function(a,b) return a+b end)", consts, ip, ip)
+
+    end,
+
+    function()
+
+      return string.format(
+
+        "local %s = %s(); if %s then %s(%s) end; %s = %s + 1",
+
+        ensureName("dv" .. tostring(math.random(1, 99999))), pop, peek, push, peek, ip, ip)
+
+    end,
+
+    function()
+
+      return string.format(
+
+        "%s(#%s + %s[2]); %s = %s + 1",
+
+        push, stack, instr, ip, ip)
+
+    end,
+
+    function()
+
+      return string.format(
+
+        "local %s = %s[%s] or 0; %s(%s * 2); %s = %s + 1",
+
+        ensureName("tmpr" .. tostring(math.random(1, 99999))), stack, sp, push, sp, ip, ip)
+
+    end,
+
+  }
+
+
+
+  local branches = {}
+
+  for i = 1, count do
+
+    local decoyNum = math.random(-9999, 9999)
+
+    local cond = genAlwaysFalsePredicate(probe)
+
+    local body = flavors[math.random(1, #flavors)]()
+
+    branches[#branches + 1] = string.format(
+
+      "elseif %s == %d and %s then %s",
+
+      ensureName("op"), decoyNum, cond, body
+
+    )
+
+  end
+
+  return table.concat(branches, "\n      ")
+
+end
+
+
+
+local function renderTemplate(template, OPNUM, BINNUM, UNNUM)
+
+  local nameCache = {}
+
+  local function ensureName(tok)
+
+    if not nameCache[tok] then nameCache[tok] = randomIdent() end
+
+    return nameCache[tok]
+
+  end
+
+  return substitute(template, function(tok)
+
+    if tok:sub(1, 2) == "N_" then
+
+      local opname = tok:sub(3)
+
+      assert(OPNUM[opname], "unknown opcode placeholder " .. tok)
+
+      return tostring(OPNUM[opname])
+
+    end
+
+    if tok:sub(1, 3) == "BN_" then
+
+      local tokenName = tok:sub(4)
+
+      for sym, name in pairs(BINOP_TOKEN_NAMES) do
+
+        if name == tokenName then return tostring(BINNUM[sym]) end
+
+      end
+
+      error("unknown binop placeholder " .. tok)
+
+    end
+
+    if tok:sub(1, 3) == "UN_" then
+
+      local tokenName = tok:sub(4)
+
+      for sym, name in pairs(UNOP_TOKEN_NAMES) do
+
+        if name == tokenName then return tostring(UNNUM[sym]) end
+
+      end
+
+      error("unknown unop placeholder " .. tok)
+
+    end
+
+    if tok:sub(1, 4) == "OPQ_" then
+
+      local probe = ensureName("probe")
+
+      return genOpaquePredicate(probe, 2 + math.random(0, 2))
+
+    end
+
+    if tok == "DECOY_BRANCHES" then
+
+      return genDecoyBranches(ensureName, 3 + math.random(0, 4))
+
+    end
+
+    return ensureName(tok)
+
+  end)
+
+end
+
+
+
+local HEADER_TEMPLATE = [===[
+
+local %byte% = string.byte
+
+local %char% = string.char
+
+local %concat% = table.concat
+
+local function %bxor%(%a%, %b%)
+
+  local %r%, %bit%, %x%, %y% = 0, 1, %a%, %b%
+
+  while %x% > 0 or %y% > 0 do
+
+    local %xb%, %yb% = %x% % 2, %y% % 2
+
+    if %xb% ~= %yb% then %r% = %r% + %bit% end
+
+    %x% = (%x% - %xb%) / 2
+
+    %y% = (%y% - %yb%) / 2
+
+    %bit% = %bit% * 2
+
+  end
+
+  return %r%
+
+end
+
+local %key% = __XS_KEY__
+
+local %maskA% = __XS_MASKA__
+
+
+
+local function %rotr8%(%rb%, %rn%)
+
+  %rn% = %rn% % 8
+
+  if %rn% == 0 then return %rb% end
+
+  return ((%rb% * (2 ^ (8 - %rn%))) % 256) + math.floor(%rb% / (2 ^ %rn%))
+
+end
+
+
+
+local function %deriveIV%()
+
+  local %ivv% = 0
+
+  for %ivi% = 1, #%key% do %ivv% = %bxor%(%ivv%, %key%[%ivi%]) end
+
+  return %ivv%
+
+end
+
+
+
+local function %cfbUnchain%(%s%)
+
+  local %out%, %prev% = {}, %deriveIV%()
+
+  for %oi% = 1, #%s% do
+
+    local %cc% = %byte%(%s%, %oi%)
+
+    %out%[%oi%] = %char%(%bxor%(%cc%, %prev%))
+
+    %prev% = %cc%
+
+  end
+
+  return %concat%(%out%)
+
+end
+
+
+
+local function %diffuseDecrypt%(%s%)
+
+  local %seed% = 2166136261 % 16777216
+
+  for %dki% = 1, #%key% do
+
+    %seed% = %bxor%(%seed%, %key%[%dki%])
+
+    %seed% = (%seed% * 2654435 + 12345) % 16777216
+
+  end
+
+  local %out% = {}
+
+  for %oi% = 1, #%s% do
+
+    %seed% = (%seed% * 2654435 + 12345) % 16777216
+
+    local %lkbyte% = math.floor(%seed% / 65536) % 256
+
+    local %lb% = %rotr8%(%byte%(%s%, %oi%), (%oi% % 5) + 1)
+
+    %out%[%oi%] = %char%(%bxor%(%lb%, %lkbyte%))
+
+  end
+
+  return %concat%(%out%)
+
+end
+
+
+
+local function %rc4Decrypt%(%s%)
+
+  local %S% = {}
+
+  for %si% = 0, 255 do %S%[%si%] = %si% end
+
+  local %sj%, %kl% = 0, #%key%
+
+  for %si% = 0, 255 do
+
+    %sj% = (%sj% + %S%[%si%] + %key%[(%si% % %kl%) + 1]) % 256
+
+    %S%[%si%], %S%[%sj%] = %S%[%sj%], %S%[%si%]
+
+  end
+
+  local %ri%, %rj% = 0, 0
+
+  local %out% = {}
+
+  for %oi% = 1, #%s% do
+
+    %ri% = (%ri% + 1) % 256
+
+    %rj% = (%rj% + %S%[%ri%]) % 256
+
+    %S%[%ri%], %S%[%rj%] = %S%[%rj%], %S%[%ri%]
+
+    local %kbyte% = %S%[(%S%[%ri%] + %S%[%rj%]) % 256]
+
+    %out%[%oi%] = %char%(%bxor%(%byte%(%s%, %oi%), %kbyte%))
+
+  end
+
+  return %concat%(%out%)
+
+end
+
+
+
+local function %decode%(%s%)
+
+  return %rc4Decrypt%(%diffuseDecrypt%(%cfbUnchain%(%s%)))
+
+end
+
+local %raw% = { __XS_CIPHERS__ }
+
+local %protos% = { __XS_PROTOS__ }
+
+
+
+local %corrupt% = function()
+
+  for %kci% = 1, #%key% do %key%[%kci%] = (%key%[%kci%] + 97) % 256 end
+
+  for %cpi% = 1, #%protos% do
+
+    local %cpc% = %protos%[%cpi%].c
+
+    for %cpj% = 1, #%cpc% do %cpc%[%cpj%][1] = -1 end
+
+  end
+
+end
+
+
+
+local function %verify%()
+
+  local %h% = 5381
+
+  local function %mix%(%n%) %h% = (%h% * 31 + (%n% or 0)) % 2147483647 end
+
+  for %vci% = 1, #%raw% do
+
+    local %vs% = %raw%[%vci%]
+
+    for %vcj% = 1, #%vs% do %mix%(%byte%(%vs%, %vcj%)) end
+
+  end
+
+  for %vpi% = 1, #%protos% do
+
+    local %vpr% = %protos%[%vpi%]
+
+    %mix%(%vpr%.v and 1 or 0)
+
+    local %vpc% = %vpr%.c
+
+    for %vpk% = 1, #%vpc% do
+
+      local %vins% = %vpc%[%vpk%]
+
+      %mix%(%vins%[1]); %mix%(%vins%[2]); %mix%(%vins%[3]); %mix%(%vins%[4])
+
+    end
+
+    local %vpp% = %vpr%.p
+
+    for %vpj% = 1, #%vpp% do %mix%(%vpp%[%vpj%][1]); %mix%(%vpp%[%vpj%][2]) end
+
+  end
+
+  return (not __XS_ANTITAMPER_ON__) or (%h% == __XS_CHECKSUM__)
+
+end
+
+
+
+if not %verify%() then %corrupt%() end
+
+
+
+if __XS_ANTIDEBUG__ then
+
+  local %dok%, %dlib% = pcall(function() return debug end)
+
+  if %dok% and %dlib% and %dlib%.gethook then
+
+    local %hok%, %hfn% = pcall(%dlib%.gethook)
+
+    if %hok% and %hfn% ~= nil then %corrupt%() end
+
+  end
+
+  local %ook%, %olib% = pcall(function() return os end)
+
+  if %ook% and %olib% and %olib%.clock then
+
+    local %t0% = %olib%.clock()
+
+    local %junk% = 0
+
+    for %ji% = 1, 30000 do %junk% = %junk% + %ji% end
+
+    if (%olib%.clock() - %t0%) > 0.35 then %corrupt%() end
+
+  end
+
+end
+
+
+
+local %consts% = {}
+
+for %i2% = 1, #%raw% do
+
+  local %dv% = %decode%(%raw%[%i2%])
+
+  local %tg% = %dv%:sub(1, 1)
+
+  if %tg% == "N" then %consts%[%i2%] = tonumber(%dv%:sub(2)) - %maskA% else %consts%[%i2%] = %dv%:sub(2) end
+
+end
+
+
+
+do
+
+  local %wmVal% = %consts%[__XS_WMIDX__]
+
+  local %wmChecked%, %wmCount% = %wmVal%:gsub("Protected by XenonSec", "Protected by XenonSec")
+
+  if %wmCount% ~= 1 or %wmChecked% ~= "Protected by XenonSec" then %corrupt%() end
+
+end
+
+
+
+if __XS_ANTIDEBUG__ then
+
+  local %envIdx% = { __XS_ENVIDX__ }
+
+  for %eni% = 1, #%envIdx% do
+
+    local %enName% = %consts%[%envIdx%[%eni%]]
+
+    local %enok%, %enfn% = pcall(function() return _G[%enName%] end)
+
+    if %enok% and %enfn% ~= nil and type(%enfn%) ~= "function" then %corrupt%() end
+
+  end
+
+end]===]
+
+
+
+local FOOTER_TEMPLATE = [===[
+
+if not %verify%() then %corrupt%() end
+
+return (%engine%)({ %consts%, %protos%, __XS_MAIN__ }, ...)]===]
+
+
+
+local function minifyTemplateText(text)
+
+  local lines = {}
+
+  for line in (text .. "\n"):gmatch("(.-)\n") do
+
+    local trimmed = line:match("^%s*(.-)%s*$")
+
+    if trimmed ~= "" and not (trimmed:sub(1, 2) == "--" and trimmed:sub(1, 4) ~= "--[[" and trimmed:sub(1, 4) ~= "--]]") then
+
+      lines[#lines + 1] = trimmed
+
+    end
+
+  end
+
+  return table.concat(lines, "\n")
+
+end
+
+
+
+local function plainReplace(str, target, replacement)
+
+  local s, e = str:find(target, 1, true)
+
+  if not s then return str end
+
+  return str:sub(1, s - 1) .. replacement .. str:sub(e + 1)
+
+end
+
+
+
+local DEFAULTS = {
+
+  minify = true,
+
+  junkRate = 0.12,
+
+  decoyConstants = nil,
+
+  localizeGlobals = true,
+
+  fold = true,
+
+  ssa = true,
+
+  luau = false,
+
+  antiTamper = true,
+
+  antiDebug = false,
+
+}
+
+
+
+local function obfuscate(source, chunkname, opts)
+
+  opts = opts or {}
+
+  for k, v in pairs(DEFAULTS) do
+
+    if opts[k] == nil then opts[k] = v end
+
+  end
+
+
+
+  local ast = Parser.parse(source, chunkname or "input", opts.luau)
+
+  local earlyCaptured = Capture.analyze(ast)
+
+  if opts.fold then Fold.apply(ast) end
+
+  if opts.ssa then
+
+    SSA.apply(ast, earlyCaptured)
+
+    if opts.fold then Fold.apply(ast) end
+
+  end
+
+  if opts.localizeGlobals then Localize.apply(ast) end
+
+  Renamer.resolve(ast)
+
+  local captured = Capture.analyze(ast)
+
+  local mod = Compiler.compile(ast, captured)
+
+  if opts.junkRate and opts.junkRate > 0 then Junk.inject(mod, opts.junkRate) end
+
+  local bundle = buildBundle(mod, opts)
+
+
+
+  local vmSrc = opts.minify and minifyTemplateText(VM_TEMPLATE) or VM_TEMPLATE
+
+  local engineSrc = renderTemplate(vmSrc, bundle.OPNUM, bundle.BINNUM, bundle.UNNUM)
+
+
+
+  local keyLit = "{" .. table.concat(bundle.key, ",") .. "}"
+
+  local cipherLits = {}
+
+  for i, c in ipairs(bundle.cipherConsts) do
+
+    cipherLits[i] = string.format("%q", c)
+
+  end
+
+  local ciphersLit = table.concat(cipherLits, ",")
+
+  local protosLit = table.concat(bundle.protoLits, ",")
+
+
+
+  local nameCache = {}
+
+  local function resolveShared(tok)
+
+    if tok == "engine" then return nil end
+
+    if not nameCache[tok] then nameCache[tok] = randomIdent() end
+
+    return nameCache[tok]
+
+  end
+
+
+
+  local headerTpl = opts.minify and minifyTemplateText(HEADER_TEMPLATE) or HEADER_TEMPLATE
+
+  local footerTpl = opts.minify and minifyTemplateText(FOOTER_TEMPLATE) or FOOTER_TEMPLATE
+
+
+
+  local header = substitute(headerTpl, resolveShared)
+
+  header = plainReplace(header, "__XS_KEY__", keyLit)
+
+  header = plainReplace(header, "__XS_MASKA__", tostring(bundle.maskA))
+
+  header = plainReplace(header, "__XS_CIPHERS__", ciphersLit)
+
+  header = plainReplace(header, "__XS_PROTOS__", protosLit)
+
+  header = plainReplace(header, "__XS_CHECKSUM__", tostring(bundle.checksum))
+
+  header = plainReplace(header, "__XS_ANTITAMPER_ON__", tostring(opts.antiTamper))
+
+  header = plainReplace(header, "__XS_ANTIDEBUG__", tostring(opts.antiDebug))
+
+  header = plainReplace(header, "__XS_ENVIDX__", table.concat(bundle.envCheckIdx, ","))
+
+  header = plainReplace(header, "__XS_WMIDX__", tostring(bundle.watermarkIdx))
+
+
+
+  local footer = substitute(footerTpl, function(tok)
+
+    if tok == "engine" then return "(function()\n" .. engineSrc .. "\nend)()" end
+
+    return resolveShared(tok)
+
+  end)
+
+  footer = plainReplace(footer, "__XS_MAIN__", tostring(bundle.mainProto))
+
+
+
+  local combined = header .. "\n" .. footer
+
+  return "return (function(...)\n" .. combined .. "\nend)(...)\n"
+
+end
+
+
+
+return { obfuscate = obfuscate }
+
+localize.lua
+
+local Localize = {}
+
+
+
+local function pushFrame(stack) stack[#stack + 1] = {}; return stack[#stack] end
+
+local function popFrame(stack) stack[#stack] = nil end
+
+local function declare(stack, name) stack[#stack][name] = true end
+
+local function isLocal(stack, name)
+
+  for i = #stack, 1, -1 do
+
+    if stack[i][name] then return true end
+
+  end
+
+  return false
+
+end
+
+
+
+local walkExpr, walkStat, walkBlockBare, walkBlockScoped, walkFunction
+
+
+
+local function markRead(name, stack, reads)
+
+  if not isLocal(stack, name) then reads[name] = true end
+
+end
+
+local function markWrite(name, stack, writes)
+
+  if not isLocal(stack, name) then writes[name] = true end
+
+end
+
+
+
+function walkExpr(node, stack, reads, writes)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" then
+
+  elseif kind == "Name" then
+
+    markRead(node.name, stack, reads)
+
+  elseif kind == "Index" then
+
+    walkExpr(node.obj, stack, reads, writes)
+
+    walkExpr(node.key, stack, reads, writes)
+
+  elseif kind == "Paren" then
+
+    walkExpr(node.expr, stack, reads, writes)
+
+  elseif kind == "Table" then
+
+    for _, field in ipairs(node.fields) do
+
+      if field.type == "keyed" then walkExpr(field.key, stack, reads, writes) end
+
+      walkExpr(field.value, stack, reads, writes)
+
+    end
+
+  elseif kind == "Function" then
+
+    walkFunction(node, stack, reads, writes)
+
+  elseif kind == "Call" then
+
+    walkExpr(node.fn, stack, reads, writes)
+
+    for _, a in ipairs(node.args) do walkExpr(a, stack, reads, writes) end
+
+  elseif kind == "MethodCall" then
+
+    walkExpr(node.obj, stack, reads, writes)
+
+    for _, a in ipairs(node.args) do walkExpr(a, stack, reads, writes) end
+
+  elseif kind == "Binop" then
+
+    walkExpr(node.lhs, stack, reads, writes)
+
+    walkExpr(node.rhs, stack, reads, writes)
+
+  elseif kind == "Unop" then
+
+    walkExpr(node.operand, stack, reads, writes)
+
+  else
+
+    error("XenonSec localize: unknown expression kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+function walkFunction(node, stack, reads, writes)
+
+  pushFrame(stack)
+
+  for _, p in ipairs(node.params) do declare(stack, p) end
+
+  walkBlockBare(node.body, stack, reads, writes)
+
+  popFrame(stack)
+
+end
+
+
+
+function walkStat(node, stack, reads, writes)
+
+  local kind = node.kind
+
+  if kind == "Local" then
+
+    for _, v in ipairs(node.values) do walkExpr(v, stack, reads, writes) end
+
+    for _, n in ipairs(node.names) do declare(stack, n) end
+
+  elseif kind == "LocalFunction" then
+
+    declare(stack, node.name)
+
+    walkExpr(node.func, stack, reads, writes)
+
+  elseif kind == "Assign" then
+
+    for _, v in ipairs(node.values) do walkExpr(v, stack, reads, writes) end
+
+    for _, tgt in ipairs(node.targets) do
+
+      if tgt.kind == "Name" then
+
+        markWrite(tgt.name, stack, writes)
+
+      else
+
+        walkExpr(tgt.obj, stack, reads, writes)
+
+        walkExpr(tgt.key, stack, reads, writes)
+
+      end
+
+    end
+
+  elseif kind == "ExprStat" then
+
+    walkExpr(node.expr, stack, reads, writes)
+
+  elseif kind == "Do" then
+
+    walkBlockScoped(node.body, stack, reads, writes)
+
+  elseif kind == "If" then
+
+    for _, clause in ipairs(node.clauses) do
+
+      walkExpr(clause.cond, stack, reads, writes)
+
+      walkBlockScoped(clause.body, stack, reads, writes)
+
+    end
+
+    if node.elseBody then walkBlockScoped(node.elseBody, stack, reads, writes) end
+
+  elseif kind == "While" then
+
+    walkExpr(node.cond, stack, reads, writes)
+
+    walkBlockScoped(node.body, stack, reads, writes)
+
+  elseif kind == "Repeat" then
+
+    pushFrame(stack)
+
+    walkBlockBare(node.body, stack, reads, writes)
+
+    walkExpr(node.cond, stack, reads, writes)
+
+    popFrame(stack)
+
+  elseif kind == "Break" or kind == "Continue" then
+
+  elseif kind == "NumericFor" then
+
+    walkExpr(node.start, stack, reads, writes)
+
+    walkExpr(node.limit, stack, reads, writes)
+
+    if node.step then walkExpr(node.step, stack, reads, writes) end
+
+    pushFrame(stack)
+
+    declare(stack, node.var)
+
+    walkBlockBare(node.body, stack, reads, writes)
+
+    popFrame(stack)
+
+  elseif kind == "GenericFor" then
+
+    for _, e in ipairs(node.exprs) do walkExpr(e, stack, reads, writes) end
+
+    pushFrame(stack)
+
+    for _, n in ipairs(node.names) do declare(stack, n) end
+
+    walkBlockBare(node.body, stack, reads, writes)
+
+    popFrame(stack)
+
+  elseif kind == "Return" then
+
+    for _, a in ipairs(node.args) do walkExpr(a, stack, reads, writes) end
+
+  else
+
+    error("XenonSec localize: unknown statement kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+function walkBlockBare(block, stack, reads, writes)
+
+  for _, stat in ipairs(block.body) do walkStat(stat, stack, reads, writes) end
+
+end
+
+
+
+function walkBlockScoped(block, stack, reads, writes)
+
+  pushFrame(stack)
+
+  walkBlockBare(block, stack, reads, writes)
+
+  popFrame(stack)
+
+end
+
+
+
+function Localize.apply(ast)
+
+  local stack = {}
+
+  pushFrame(stack)
+
+  local reads, writes = {}, {}
+
+  walkBlockBare(ast, stack, reads, writes)
+
+  popFrame(stack)
+
+
+
+  local order = {}
+
+  for name in pairs(reads) do
+
+    if not writes[name] then order[#order + 1] = name end
+
+  end
+
+  table.sort(order)
+
+
+
+  local prelude = {}
+
+  for _, name in ipairs(order) do
+
+    prelude[#prelude + 1] = {
+
+      kind = "Local",
+
+      names = { name },
+
+      values = { { kind = "Name", name = name } },
+
+    }
+
+  end
+
+
+
+  local newBody = {}
+
+  for _, s in ipairs(prelude) do newBody[#newBody + 1] = s end
+
+  for _, s in ipairs(ast.body) do newBody[#newBody + 1] = s end
+
+  ast.body = newBody
+
+
+
+  return ast
+
+end
+
+
+
+return Localize
+
+lexer.lua
+
+local Lexer = {}
+Lexer.__index = Lexer
+
+local KEYWORDS = {}
+for _, k in ipairs({
+	"and","break","do","else","elseif","end","false","for","function",
+	"if","in","local","nil","not","or","repeat","return","then","true",
+	"until","while",
+}) do KEYWORDS[k] = true end
+
+local function isDigit(c) return c ~= nil and c >= "0" and c <= "9" end
+local function isAlpha(c)
+	return c ~= nil and ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or c == "_")
+end
+local function isAlphaNum(c) return isAlpha(c) or isDigit(c) end
+
+function Lexer.new(src, chunkname, luau)
+	local self = setmetatable({}, Lexer)
+	self.src = src
+	self.len = #src
+	self.pos = 1
+	self.line = 1
+	self.chunkname = chunkname or "?"
+	self.luau = luau or false
+	return self
+end
+
+function Lexer:error(msg)
+	error(string.format("XenonSec lexer error (%s:%d): %s", self.chunkname, self.line, msg), 0)
+end
+
+function Lexer:peekChar(o)
+	local p = self.pos + (o or 0)
+	if p > self.len then return nil end
+	return self.src:sub(p, p)
+end
+
+function Lexer:advance()
+	local c = self:peekChar()
+	if c == "\n" then self.line = self.line + 1 end
+	self.pos = self.pos + 1
+	return c
+end
+
+function Lexer:tryLongBracket()
+	local startPos = self.pos
+	local startLine = self.line
+	if self:peekChar() ~= "[" then return nil end
+	local p = startPos + 1
+	local level = 0
+	while self.src:sub(p, p) == "=" do
+		level = level + 1
+		p = p + 1
+	end
+	if self.src:sub(p, p) ~= "[" then return nil end
+	
+	self.pos = p + 1
+	if self:peekChar() == "\r" then self:advance() end
+	if self:peekChar() == "\n" then self:advance() end
+	
+	local buf = {}
+	local closer = "]" .. string.rep("=", level) .. "]"
+	while true do
+		if self.pos > self.len then
+			self.line = startLine
+			self:error("unterminated long bracket")
+		end
+		if self:peekChar() == "]" then
+			local candidate = self.src:sub(self.pos, self.pos + #closer - 1)
+			if candidate == closer then
+				for _ = 1, #closer do self:advance() end
+				return table.concat(buf)
+			end
+		end
+		buf[#buf + 1] = self:advance()
+	end
+end
+
+function Lexer:skipWhitespaceAndComments()
+	while true do
+		local c = self:peekChar()
+		if c == nil then return end
+		if c == " " or c == "\t" or c == "\r" or c == "\n" then
+			self:advance()
+		elseif c == "-" and self:peekChar(1) == "-" then
+			self:advance(); self:advance()
+			if self:peekChar() == "[" then
+				local savedPos = self.pos
+				local savedLine = self.line
+				local long = self:tryLongBracket()
+				if long == nil then
+					self.pos = savedPos
+					self.line = savedLine
+					while self:peekChar() ~= nil and self:peekChar() ~= "\n" do self:advance() end
+				end
+			else
+				while self:peekChar() ~= nil and self:peekChar() ~= "\n" do self:advance() end
+			end
+		else
+			return
+		end
+	end
+end
+
+local ESCAPES = {
+	a = "\a", b = "\b", f = "\f", n = "\n", r = "\r",
+	t = "\t", v = "\v", ["\\"] = "\\", ['"'] = '"', ["'"] = "'", ["\n"] = "\n",
+}
+
+function Lexer:readString(quote)
+	local buf = {}
+	self:advance()
+	while true do
+		local c = self:peekChar()
+		if c == nil or c == "\n" then
+			self:error("unterminated string")
+		end
+		if c == quote then
+			self:advance()
+			break
+		elseif c == "\\" then
+			self:advance()
+			local e = self:peekChar()
+			if e == "z" then
+				self:advance()
+				while self:peekChar() and self:peekChar():match("%s") do self:advance() end
+			elseif isDigit(e) then
+				local digits = ""
+				for _ = 1, 3 do
+					if isDigit(self:peekChar()) then digits = digits .. self:advance() else break end
+				end
+				buf[#buf + 1] = string.char(tonumber(digits) % 256)
+			elseif e == "x" then
+				self:advance()
+				local hex = ""
+				for _ = 1, 2 do
+					if self:peekChar() and self:peekChar():match("%x") then hex = hex .. self:advance() end
+				end
+				if #hex < 2 then self:error("hexadecimal escape sequence too short") end
+				buf[#buf + 1] = string.char(tonumber(hex, 16))
+			elseif ESCAPES[e] ~= nil then
+				self:advance()
+				buf[#buf + 1] = ESCAPES[e]
+			else
+				self:advance()
+				buf[#buf + 1] = e or ""
+			end
+		else
+			buf[#buf + 1] = self:advance()
+		end
+	end
+	return table.concat(buf)
+end
+
+function Lexer:readNumber()
+	local start = self.pos
+	if self:peekChar() == "0" and (self:peekChar(1) == "x" or self:peekChar(1) == "X") then
+		self:advance(); self:advance()
+		while self:peekChar() and self:peekChar():match("[%x]") do self:advance() end
+	else
+		while isDigit(self:peekChar()) do self:advance() end
+		if self:peekChar() == "." then
+			self:advance()
+			while isDigit(self:peekChar()) do self:advance() end
+		end
+		if self:peekChar() == "e" or self:peekChar() == "E" then
+			self:advance()
+			if self:peekChar() == "+" or self:peekChar() == "-" then self:advance() end
+			while isDigit(self:peekChar()) do self:advance() end
+		end
+	end
+	local text = self.src:sub(start, self.pos - 1)
+	local n = tonumber(text)
+	if not n then self:error("malformed number near '" .. text .. "'") end
+	return n
+end
+
+local SYMBOLS_3 = { ["..."] = true, ["//="] = true, ["..="] = true }
+local SYMBOLS_2 = {
+	["=="]=true, ["~="]=true, ["<="]=true, [">="]=true, [".."]=true, ["//"]=true,
+	["+="]=true, ["-="]=true, ["*="]=true, ["/="]=true, ["%="]=true, ["^="]=true,
+}
+
+function Lexer:next()
+	self:skipWhitespaceAndComments()
+	local line = self.line
+	local c = self:peekChar()
+	if c == nil then
+		return { type = "eof", line = line }
+	end
+
+	if isAlpha(c) then
+		local start = self.pos
+		while isAlphaNum(self:peekChar()) do self:advance() end
+		local word = self.src:sub(start, self.pos - 1)
+		if KEYWORDS[word] or (self.luau and word == "continue") then
+			return { type = "keyword", value = word, line = line }
+		end
+		return { type = "name", value = word, line = line }
+	end
+
+	if isDigit(c) or (c == "." and isDigit(self:peekChar(1))) then
+		local n = self:readNumber()
+		return { type = "number", value = n, line = line }
+	end
+
+	if c == '"' or c == "'" then
+		local s = self:readString(c)
+		return { type = "string", value = s, line = line }
+	end
+
+	if c == "[" and (self:peekChar(1) == "[" or self:peekChar(1) == "=") then
+		local savedPos = self.pos
+		local savedLine = self.line
+		local long = self:tryLongBracket()
+		if long ~= nil then
+			return { type = "string", value = long, line = line }
+		end
+		self.pos = savedPos
+		self.line = savedLine
+	end
+
+	local three = self.src:sub(self.pos, self.pos + 2)
+	if SYMBOLS_3[three] then
+		self.pos = self.pos + 3
+		return { type = "symbol", value = three, line = line }
+	end
+	local two = self.src:sub(self.pos, self.pos + 1)
+	if SYMBOLS_2[two] then
+		self.pos = self.pos + 2
+		return { type = "symbol", value = two, line = line }
+	end
+	self:advance()
+	return { type = "symbol", value = c, line = line }
+end
+
+function Lexer.tokenize(src, chunkname, luau)
+	local lx = Lexer.new(src, chunkname, luau)
+	local tokens = {}
+	while true do
+		local tok = lx:next()
+		tokens[#tokens + 1] = tok
+		if tok.type == "eof" then break end
+	end
+	return tokens
+end
+
+return Lexer
+parser.lua
+
+--------------------------------------------------------------------
+
+-- XenonSec :: parser.lua
+
+-- Recursive-descent parser: tokens -> AST
+
+--------------------------------------------------------------------
+
+
+
+local Lexer = dofile((debug.getinfo(1, "S").source:match("@?(.*/)") or "") .. "lexer.lua")
+
+
+
+local Parser = {}
+
+Parser.__index = Parser
+
+
+
+function Parser.new(tokens, chunkname, luau)
+
+	local self = setmetatable({}, Parser)
+
+	self.toks = tokens
+
+	self.pos = 1
+
+	self.chunkname = chunkname or "?"
+
+	self.luau = luau or false
+
+	return self
+
+end
+
+
+
+function Parser:cur() return self.toks[self.pos] end
+
+function Parser:lookahead(o) return self.toks[self.pos + o] end
+
+
+
+function Parser:error(msg)
+
+	local t = self:cur()
+
+	error(string.format("XenonSec parse error (%s:%d): %s (got %s '%s')",
+
+		self.chunkname, t and t.line or -1, msg,
+
+		t and t.type or "?", t and tostring(t.value) or "?"), 0)
+
+end
+
+
+
+function Parser:advance()
+
+	local t = self:cur()
+
+	self.pos = self.pos + 1
+
+	return t
+
+end
+
+
+
+function Parser:isKw(kw)
+
+	local t = self:cur()
+
+	return t.type == "keyword" and t.value == kw
+
+end
+
+
+
+function Parser:isSym(s)
+
+	local t = self:cur()
+
+	return t.type == "symbol" and t.value == s
+
+end
+
+
+
+function Parser:checkKw(kw)
+
+	if not self:isKw(kw) then self:error("expected keyword '" .. kw .. "'") end
+
+	return self:advance()
+
+end
+
+
+
+function Parser:checkSym(s)
+
+	if not self:isSym(s) then self:error("expected '" .. s .. "'") end
+
+	return self:advance()
+
+end
+
+
+
+function Parser:checkName()
+
+	local t = self:cur()
+
+	if t.type ~= "name" then self:error("expected identifier") end
+
+	return self:advance().value
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Luau: type annotations are parsed and fully discarded (this is a
+
+-- runtime obfuscator, not a type checker -- types have zero effect on
+
+-- compiled behavior). This is a heuristic balanced-bracket skip rather
+
+-- than a full type-grammar parser: it tracks (),{},[],<> nesting and
+
+-- treats |, &, ?, ., ->, : as "the type continues" tokens, stopping at
+
+-- the first real terminator seen at nesting depth 0.
+
+--------------------------------------------------------------------
+
+
+
+local TYPE_STOP_KEYWORDS = {
+
+	["do"]=true, ["then"]=true, ["end"]=true, ["local"]=true, ["return"]=true,
+
+	["if"]=true, ["for"]=true, ["while"]=true, ["repeat"]=true, ["break"]=true,
+
+	["until"]=true, ["else"]=true, ["elseif"]=true, ["in"]=true,
+
+}
+
+
+
+function Parser:skipTypeExpr()
+
+	local depth = 0
+
+	local lastWasMinus = false
+
+	while true do
+
+		local t = self:cur()
+
+		if t.type == "eof" then break end
+
+		local isMinus = false
+
+		if t.type == "symbol" then
+
+			local v = t.value
+
+			if v == "(" or v == "{" or v == "[" or v == "<" then
+
+				depth = depth + 1; self:advance()
+
+			elseif v == ")" or v == "}" or v == "]" then
+
+				if depth == 0 then break end
+
+				depth = depth - 1; self:advance()
+
+			elseif v == ">" then
+
+				if depth == 0 and not lastWasMinus then break end
+
+				if depth > 0 then depth = depth - 1 end
+
+				self:advance()
+
+			elseif depth == 0 and (v == "," or v == "=" or v == ";") then
+
+				break
+
+			elseif v == "|" or v == "&" or v == "?" or v == "." or v == ":" then
+
+				self:advance()
+
+			elseif v == "-" then
+
+				isMinus = true; self:advance()
+
+			else
+
+				if depth == 0 then break end
+
+				self:advance()
+
+			end
+
+		elseif t.type == "keyword" then
+
+			if depth == 0 and TYPE_STOP_KEYWORDS[t.value] then break end
+
+			if t.value == "function" and depth == 0 then
+
+				-- rare: a function-type spelled with the `function` keyword
+
+				self:advance()
+
+			else
+
+				self:advance() -- e.g. `nil` as a literal type
+
+			end
+
+		else
+
+			self:advance() -- name/number/string content of the type
+
+		end
+
+		lastWasMinus = isMinus
+
+	end
+
+end
+
+
+
+-- Consumes `: Type` if present (Luau) and self.luau is on; no-op otherwise.
+
+function Parser:maybeSkipTypeAnnotation()
+
+	if self.luau and self:isSym(":") then
+
+		self:advance()
+
+		self:skipTypeExpr()
+
+	end
+
+end
+
+
+
+-- Consumes a `<T, U, ...>` generic parameter list if present.
+
+function Parser:maybeSkipGenerics()
+
+	if self.luau and self:isSym("<") then
+
+		self:advance()
+
+		local depth = 1
+
+		while depth > 0 do
+
+			local t = self:cur()
+
+			if t.type == "eof" then break end
+
+			if t.type == "symbol" and t.value == "<" then depth = depth + 1
+
+			elseif t.type == "symbol" and t.value == ">" then depth = depth - 1
+
+			end
+
+			self:advance()
+
+		end
+
+	end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Blocks / statements
+
+--------------------------------------------------------------------
+
+
+
+local BLOCK_END = {
+
+	["end"] = true, ["else"] = true, ["elseif"] = true, ["until"] = true,
+
+}
+
+
+
+function Parser:parseChunk()
+
+	local block = self:parseBlock()
+
+	if self:cur().type ~= "eof" then
+
+		self:error("unexpected token at top level")
+
+	end
+
+	return block
+
+end
+
+
+
+function Parser:blockFollow()
+
+	local t = self:cur()
+
+	if t.type == "eof" then return true end
+
+	if t.type == "keyword" and BLOCK_END[t.value] then return true end
+
+	return false
+
+end
+
+
+
+function Parser:parseBlock()
+
+	local stmts = {}
+
+	while not self:blockFollow() do
+
+		if self:isKw("return") then
+
+			stmts[#stmts + 1] = self:parseReturn()
+
+			break
+
+		end
+
+		local s = self:parseStatement()
+
+		if s then stmts[#stmts + 1] = s end
+
+	end
+
+	return { kind = "Block", body = stmts }
+
+end
+
+
+
+function Parser:parseReturn()
+
+	local line = self:cur().line
+
+	self:checkKw("return")
+
+	local exprs = {}
+
+	if not self:blockFollow() and not self:isSym(";") then
+
+		exprs = self:parseExprList()
+
+	end
+
+	if self:isSym(";") then self:advance() end
+
+	return { kind = "Return", args = exprs, line = line }
+
+end
+
+
+
+function Parser:parseStatement()
+
+	local t = self:cur()
+
+	if self:isSym(";") then
+
+		self:advance()
+
+		return nil
+
+	elseif self:isKw("if") then
+
+		return self:parseIf()
+
+	elseif self:isKw("while") then
+
+		return self:parseWhile()
+
+	elseif self:isKw("do") then
+
+		self:advance()
+
+		local body = self:parseBlock()
+
+		self:checkKw("end")
+
+		return { kind = "Do", body = body }
+
+	elseif self:isKw("for") then
+
+		return self:parseFor()
+
+	elseif self:isKw("repeat") then
+
+		return self:parseRepeat()
+
+	elseif self:isKw("function") then
+
+		return self:parseFunctionStat()
+
+	elseif self:isKw("local") then
+
+		return self:parseLocal()
+
+	elseif self:isKw("break") then
+
+		self:advance()
+
+		return { kind = "Break", line = t.line }
+
+	elseif self.luau and self:isKw("continue") then
+
+		self:advance()
+
+		return { kind = "Continue", line = t.line }
+
+	elseif self.luau and t.type == "name" and t.value == "type"
+
+		and self:lookahead(1) and self:lookahead(1).type == "name" then
+
+		-- `type NAME = ...` or `type NAME<T> = ...` type-alias
+
+		-- declaration: parsed and fully discarded, zero runtime effect.
+
+		self:advance() -- 'type'
+
+		self:advance() -- alias name
+
+		self:maybeSkipGenerics()
+
+		self:checkSym("=")
+
+		self:skipTypeExpr()
+
+		return { kind = "Do", body = { kind = "Block", body = {} } } -- no-op
+
+	else
+
+		return self:parseExprStat()
+
+	end
+
+end
+
+
+
+function Parser:parseIf()
+
+	local line = self:cur().line
+
+	self:checkKw("if")
+
+	local clauses = {}
+
+	local cond = self:parseExpr()
+
+	self:checkKw("then")
+
+	local body = self:parseBlock()
+
+	clauses[#clauses + 1] = { cond = cond, body = body }
+
+	while self:isKw("elseif") do
+
+		self:advance()
+
+		local c = self:parseExpr()
+
+		self:checkKw("then")
+
+		local b = self:parseBlock()
+
+		clauses[#clauses + 1] = { cond = c, body = b }
+
+	end
+
+	local elseBody = nil
+
+	if self:isKw("else") then
+
+		self:advance()
+
+		elseBody = self:parseBlock()
+
+	end
+
+	self:checkKw("end")
+
+	return { kind = "If", clauses = clauses, elseBody = elseBody, line = line }
+
+end
+
+
+
+function Parser:parseWhile()
+
+	local line = self:cur().line
+
+	self:checkKw("while")
+
+	local cond = self:parseExpr()
+
+	self:checkKw("do")
+
+	local body = self:parseBlock()
+
+	self:checkKw("end")
+
+	return { kind = "While", cond = cond, body = body, line = line }
+
+end
+
+
+
+function Parser:parseRepeat()
+
+	local line = self:cur().line
+
+	self:checkKw("repeat")
+
+	local body = self:parseBlock()
+
+	self:checkKw("until")
+
+	local cond = self:parseExpr()
+
+	return { kind = "Repeat", cond = cond, body = body, line = line }
+
+end
+
+
+
+function Parser:parseFor()
+
+	local line = self:cur().line
+
+	self:checkKw("for")
+
+	local firstName = self:checkName()
+
+	if self:isSym("=") then
+
+		self:advance()
+
+		local start = self:parseExpr()
+
+		self:checkSym(",")
+
+		local limit = self:parseExpr()
+
+		local step = nil
+
+		if self:isSym(",") then
+
+			self:advance()
+
+			step = self:parseExpr()
+
+		end
+
+		self:checkKw("do")
+
+		local body = self:parseBlock()
+
+		self:checkKw("end")
+
+		return { kind = "NumericFor", var = firstName, start = start, limit = limit, step = step, body = body, line = line }
+
+	else
+
+		local names = { firstName }
+
+		while self:isSym(",") do
+
+			self:advance()
+
+			names[#names + 1] = self:checkName()
+
+		end
+
+		self:checkKw("in")
+
+		local exprs = self:parseExprList()
+
+		self:checkKw("do")
+
+		local body = self:parseBlock()
+
+		self:checkKw("end")
+
+		return { kind = "GenericFor", names = names, exprs = exprs, body = body, line = line }
+
+	end
+
+end
+
+
+
+function Parser:parseFunctionStat()
+
+	local line = self:cur().line
+
+	self:checkKw("function")
+
+	-- funcname ::= Name {'.' Name} [':' Name]
+
+	local base = { kind = "Name", name = self:checkName(), line = line }
+
+	local isMethod = false
+
+	while self:isSym(".") or self:isSym(":") do
+
+		local isColon = self:isSym(":")
+
+		self:advance()
+
+		local key = self:checkName()
+
+		base = { kind = "Index", obj = base, key = { kind = "String", value = key }, line = line }
+
+		if isColon then isMethod = true; break end
+
+	end
+
+	self:maybeSkipGenerics()
+
+	local func = self:parseFunctionBody(isMethod, line)
+
+	return { kind = "Assign", targets = { base }, values = { func }, line = line }
+
+end
+
+
+
+function Parser:parseLocal()
+
+	local line = self:cur().line
+
+	self:checkKw("local")
+
+	if self:isKw("function") then
+
+		self:advance()
+
+		local name = self:checkName()
+
+		self:maybeSkipGenerics()
+
+		local func = self:parseFunctionBody(false, line)
+
+		return { kind = "LocalFunction", name = name, func = func, line = line }
+
+	end
+
+	local names = { self:checkName() }
+
+	self:maybeSkipTypeAnnotation()
+
+	if self:isSym("<") then -- ignore Lua 5.4 attribs defensively; not in 5.1 but harmless
+
+		self:advance(); self:checkName(); self:checkSym(">")
+
+	end
+
+	while self:isSym(",") do
+
+		self:advance()
+
+		names[#names + 1] = self:checkName()
+
+		self:maybeSkipTypeAnnotation()
+
+		if self:isSym("<") then
+
+			self:advance(); self:checkName(); self:checkSym(">")
+
+		end
+
+	end
+
+	local values = {}
+
+	if self:isSym("=") then
+
+		self:advance()
+
+		values = self:parseExprList()
+
+	end
+
+	return { kind = "Local", names = names, values = values, line = line }
+
+end
+
+
+
+local COMPOUND_OPS = {
+
+	["+="] = "+", ["-="] = "-", ["*="] = "*", ["/="] = "/",
+
+	["//="] = "//", ["%="] = "%", ["^="] = "^", ["..="] = "..",
+
+}
+
+
+
+local compoundTempCounter = 0
+
+local function freshCompoundTemp()
+
+	compoundTempCounter = compoundTempCounter + 1
+
+	return "\3ca" .. compoundTempCounter -- control-char prefix: can't collide with real source identifiers
+
+end
+
+
+
+function Parser:isCompoundAssignSym()
+
+	local t = self:cur()
+
+	return self.luau and t.type == "symbol" and COMPOUND_OPS[t.value] ~= nil
+
+end
+
+
+
+function Parser:parseExprStat()
+
+	local line = self:cur().line
+
+	local expr = self:parseSuffixedExpr()
+
+
+
+	if self:isCompoundAssignSym() then
+
+		local op = COMPOUND_OPS[self:cur().value]
+
+		self:advance()
+
+		local rhs = self:parseExpr()
+
+		if expr.kind ~= "Name" and expr.kind ~= "Index" then
+
+			self:error("cannot compound-assign to this expression")
+
+		end
+
+
+
+		if expr.kind == "Name" then
+
+			-- Reading a plain variable twice has no side effects, so this
+
+			-- desugars directly with no temps needed.
+
+			local lhsCopy = { kind = "Name", name = expr.name, line = line }
+
+			return {
+
+				kind = "Assign",
+
+				targets = { expr },
+
+				values = { { kind = "Binop", op = op, lhs = lhsCopy, rhs = rhs, line = line } },
+
+				line = line,
+
+			}
+
+		else
+
+			-- Index target: evaluate the object/key exactly once each,
+
+			-- via temp locals, so `getTable()[computeKey()] += v` never
+
+			-- re-runs those side-effecting expressions a second time.
+
+			local tmpObj, tmpKey = freshCompoundTemp(), freshCompoundTemp()
+
+			local tmpObjRef = { kind = "Name", name = tmpObj, line = line }
+
+			local tmpKeyRef = { kind = "Name", name = tmpKey, line = line }
+
+			local idxRead = { kind = "Index", obj = tmpObjRef, key = tmpKeyRef, line = line }
+
+			local idxWrite = { kind = "Index", obj = { kind = "Name", name = tmpObj, line = line },
+
+				key = { kind = "Name", name = tmpKey, line = line }, line = line }
+
+			return {
+
+				kind = "Do",
+
+				body = { kind = "Block", body = {
+
+					{ kind = "Local", names = { tmpObj }, values = { expr.obj }, line = line },
+
+					{ kind = "Local", names = { tmpKey }, values = { expr.key }, line = line },
+
+					{ kind = "Assign", targets = { idxWrite },
+
+						values = { { kind = "Binop", op = op, lhs = idxRead, rhs = rhs, line = line } },
+
+						line = line },
+
+				} },
+
+			}
+
+		end
+
+	end
+
+
+
+	if self:isSym("=") or self:isSym(",") then
+
+		local targets = { expr }
+
+		while self:isSym(",") do
+
+			self:advance()
+
+			targets[#targets + 1] = self:parseSuffixedExpr()
+
+		end
+
+		self:checkSym("=")
+
+		local values = self:parseExprList()
+
+		for _, tgt in ipairs(targets) do
+
+			if tgt.kind ~= "Name" and tgt.kind ~= "Index" then
+
+				self:error("cannot assign to this expression")
+
+			end
+
+		end
+
+		return { kind = "Assign", targets = targets, values = values, line = line }
+
+	end
+
+	if expr.kind ~= "Call" and expr.kind ~= "MethodCall" then
+
+		self:error("syntax error: expression statement must be a function call")
+
+	end
+
+	return { kind = "ExprStat", expr = expr, line = line }
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Expressions (precedence climbing)
+
+--------------------------------------------------------------------
+
+
+
+function Parser:parseExprList()
+
+	local list = { self:parseExpr() }
+
+	while self:isSym(",") do
+
+		self:advance()
+
+		list[#list + 1] = self:parseExpr()
+
+	end
+
+	return list
+
+end
+
+
+
+-- binary operator priority: {left, right}
+
+local BINPRI = {
+
+	["or"] = {1,1}, ["and"] = {2,2},
+
+	["<"]={3,3}, [">"]={3,3}, ["<="]={3,3}, [">="]={3,3}, ["~="]={3,3}, ["=="]={3,3},
+
+	[".."]={5,4}, -- right assoc
+
+	["+"]={6,6}, ["-"]={6,6},
+
+	["*"]={7,7}, ["/"]={7,7}, ["%"]={7,7}, ["//"]={7,7},
+
+	["^"]={10,9}, -- right assoc
+
+}
+
+local UNARY_PRI = 8
+
+
+
+local function tokBinOp(t)
+
+	if t.type == "symbol" and BINPRI[t.value] then return t.value end
+
+	if t.type == "keyword" and (t.value == "and" or t.value == "or") then return t.value end
+
+	return nil
+
+end
+
+
+
+function Parser:parseExpr(limit)
+
+	limit = limit or 0
+
+	local line = self:cur().line
+
+	local left
+
+	if self:isKw("not") or self:isSym("-") or self:isSym("#") then
+
+		local op = self:advance().value
+
+		local operand = self:parseExpr(UNARY_PRI)
+
+		left = { kind = "Unop", op = op, operand = operand, line = line }
+
+	else
+
+		left = self:parseSimpleExpr()
+
+	end
+
+	while true do
+
+		local t = self:cur()
+
+		local op = tokBinOp(t)
+
+		if not op or BINPRI[op][1] <= limit then break end
+
+		self:advance()
+
+		local right = self:parseExpr(BINPRI[op][2])
+
+		left = { kind = "Binop", op = op, lhs = left, rhs = right, line = t.line }
+
+	end
+
+	return left
+
+end
+
+
+
+function Parser:parseSimpleExpr()
+
+	local t = self:cur()
+
+	if t.type == "number" then
+
+		self:advance(); return { kind = "Number", value = t.value, line = t.line }
+
+	elseif t.type == "string" then
+
+		self:advance(); return { kind = "String", value = t.value, line = t.line }
+
+	elseif t.type == "keyword" and t.value == "nil" then
+
+		self:advance(); return { kind = "Nil", line = t.line }
+
+	elseif t.type == "keyword" and t.value == "true" then
+
+		self:advance(); return { kind = "True", line = t.line }
+
+	elseif t.type == "keyword" and t.value == "false" then
+
+		self:advance(); return { kind = "False", line = t.line }
+
+	elseif t.type == "symbol" and t.value == "..." then
+
+		self:advance(); return { kind = "Vararg", line = t.line }
+
+	elseif t.type == "symbol" and t.value == "{" then
+
+		return self:parseTableConstructor()
+
+	elseif t.type == "keyword" and t.value == "function" then
+
+		self:advance()
+
+		return self:parseFunctionBody(false, t.line)
+
+	elseif self.luau and t.type == "keyword" and t.value == "if" then
+
+		return self:parseIfExpr()
+
+	else
+
+		return self:parseSuffixedExpr()
+
+	end
+
+end
+
+
+
+-- Luau if-then-else EXPRESSION: `if C then E elseif C2 then E2 else E3`.
+
+-- Desugared into `(function() if C then return E ... end end)()` --
+
+-- reusing only already-supported AST node kinds (Function/Call/If/
+
+-- Return), so none of the analysis passes need to know a ternary
+
+-- expression exists at all. This is semantically exact (a real
+
+-- conditional, unlike the classic `cond and a or b` trick, which
+
+-- breaks when `a` is falsy).
+
+function Parser:parseIfExpr()
+
+	local line = self:cur().line
+
+	self:checkKw("if")
+
+	local clauses = {}
+
+	local cond = self:parseExpr()
+
+	self:checkKw("then")
+
+	local thenExpr = self:parseExpr()
+
+	clauses[#clauses + 1] = { cond = cond, body = { kind = "Block", body = {
+
+		{ kind = "Return", args = { thenExpr }, line = line },
+
+	} } }
+
+	while self:isKw("elseif") do
+
+		self:advance()
+
+		local c = self:parseExpr()
+
+		self:checkKw("then")
+
+		local e = self:parseExpr()
+
+		clauses[#clauses + 1] = { cond = c, body = { kind = "Block", body = {
+
+			{ kind = "Return", args = { e }, line = line },
+
+		} } }
+
+	end
+
+	self:checkKw("else") -- mandatory in Luau if-expressions (no implicit nil branch)
+
+	local elseExpr = self:parseExpr()
+
+	local elseBody = { kind = "Block", body = { { kind = "Return", args = { elseExpr }, line = line } } }
+
+
+
+	local ifStat = { kind = "If", clauses = clauses, elseBody = elseBody, line = line }
+
+	local func = { kind = "Function", params = {}, hasVararg = false,
+
+		body = { kind = "Block", body = { ifStat } }, line = line }
+
+	return { kind = "Call", fn = { kind = "Paren", expr = func, line = line }, args = {}, line = line }
+
+end
+
+
+
+function Parser:parsePrimaryExpr()
+
+	local t = self:cur()
+
+	if t.type == "symbol" and t.value == "(" then
+
+		self:advance()
+
+		local e = self:parseExpr()
+
+		self:checkSym(")")
+
+		return { kind = "Paren", expr = e, line = t.line }
+
+	elseif t.type == "name" then
+
+		self:advance()
+
+		return { kind = "Name", name = t.value, line = t.line }
+
+	else
+
+		self:error("unexpected symbol")
+
+	end
+
+end
+
+
+
+function Parser:parseArgs()
+
+	local t = self:cur()
+
+	if t.type == "symbol" and t.value == "(" then
+
+		self:advance()
+
+		local args = {}
+
+		if not self:isSym(")") then args = self:parseExprList() end
+
+		self:checkSym(")")
+
+		return args
+
+	elseif t.type == "string" then
+
+		self:advance()
+
+		return { { kind = "String", value = t.value, line = t.line } }
+
+	elseif t.type == "symbol" and t.value == "{" then
+
+		return { self:parseTableConstructor() }
+
+	else
+
+		self:error("function arguments expected")
+
+	end
+
+end
+
+
+
+function Parser:parseSuffixedExpr()
+
+	local expr = self:parsePrimaryExpr()
+
+	while true do
+
+		local t = self:cur()
+
+		if t.type == "symbol" and t.value == "." then
+
+			self:advance()
+
+			local key = self:checkName()
+
+			expr = { kind = "Index", obj = expr, key = { kind = "String", value = key }, line = t.line }
+
+		elseif t.type == "symbol" and t.value == "[" then
+
+			self:advance()
+
+			local key = self:parseExpr()
+
+			self:checkSym("]")
+
+			expr = { kind = "Index", obj = expr, key = key, line = t.line }
+
+		elseif t.type == "symbol" and t.value == ":" then
+
+			self:advance()
+
+			local method = self:checkName()
+
+			local args = self:parseArgs()
+
+			expr = { kind = "MethodCall", obj = expr, method = method, args = args, line = t.line }
+
+		elseif (t.type == "symbol" and (t.value == "(" or t.value == "{")) or t.type == "string" then
+
+			local args = self:parseArgs()
+
+			expr = { kind = "Call", fn = expr, args = args, line = t.line }
+
+		else
+
+			break
+
+		end
+
+	end
+
+	return expr
+
+end
+
+
+
+function Parser:parseTableConstructor()
+
+	local line = self:cur().line
+
+	self:checkSym("{")
+
+	local fields = {}
+
+	while not self:isSym("}") do
+
+		if self:isSym("[") then
+
+			self:advance()
+
+			local key = self:parseExpr()
+
+			self:checkSym("]")
+
+			self:checkSym("=")
+
+			local value = self:parseExpr()
+
+			fields[#fields + 1] = { type = "keyed", key = key, value = value }
+
+		elseif self:cur().type == "name" and self:lookahead(1).type == "symbol" and self:lookahead(1).value == "=" then
+
+			local key = self:advance().value
+
+			self:advance() -- '='
+
+			local value = self:parseExpr()
+
+			fields[#fields + 1] = { type = "keyed", key = { kind = "String", value = key }, value = value }
+
+		else
+
+			local value = self:parseExpr()
+
+			fields[#fields + 1] = { type = "positional", value = value }
+
+		end
+
+		if self:isSym(",") or self:isSym(";") then
+
+			self:advance()
+
+		else
+
+			break
+
+		end
+
+	end
+
+	self:checkSym("}")
+
+	return { kind = "Table", fields = fields, line = line }
+
+end
+
+
+
+function Parser:parseFunctionBody(isMethod, line)
+
+	self:checkSym("(")
+
+	local params = {}
+
+	local hasVararg = false
+
+	if isMethod then params[#params + 1] = "self" end
+
+	if not self:isSym(")") then
+
+		while true do
+
+			if self:isSym("...") then
+
+				self:advance()
+
+				hasVararg = true
+
+				self:maybeSkipTypeAnnotation() -- Luau: `...: T`
+
+				break
+
+			end
+
+			params[#params + 1] = self:checkName()
+
+			self:maybeSkipTypeAnnotation()
+
+			if self:isSym(",") then self:advance() else break end
+
+		end
+
+	end
+
+	self:checkSym(")")
+
+	self:maybeSkipTypeAnnotation() -- Luau: function return type, e.g. `function f(): number`
+
+	local body = self:parseBlock()
+
+	self:checkKw("end")
+
+	return { kind = "Function", params = params, hasVararg = hasVararg, body = body, line = line }
+
+end
+
+
+
+--------------------------------------------------------------------
+
+
+
+local function parse(src, chunkname, luau)
+
+	local tokens = Lexer.tokenize(src, chunkname, luau)
+
+	local p = Parser.new(tokens, chunkname, luau)
+
+	return p:parseChunk()
+
+end
+
+
+
+return { parse = parse, Parser = Parser }
+
+Junk.lua
+
+local Junk = {}
+
+local JUNK_PUSH_OPS = { "LOADNIL", "LOADTRUE", "LOADFALSE", "NEWTABLE" }
+
+local JUMP_OPS = {
+  JMP = true, JMPIFNOT = true, JMPIFNIL = true, TESTANDJMP = true, TESTORJMP = true,
+}
+
+local BINOPS_LIST = { "+", "-", "*", "/", "%", ".." }
+
+function Junk.inject(mod, rate)
+  rate = rate or 0.15
+  for _, proto in ipairs(mod.protos) do
+    local old = proto.code
+    local newCode = {}
+    local map = {}
+
+    for i = 1, #old do
+      local r = math.random()
+      
+      if r < rate then
+        local junkType = math.random(1, 3)
+
+        if junkType == 1 then
+          
+          newCode[#newCode + 1] = { op = "CPLX", a = math.random(0, 50), b = math.random(100, 999) }
+
+        elseif junkType == 2 then
+          
+          newCode[#newCode + 1] = { op = "LOADTRUE" }
+          local testJmpIdx = #newCode + 1
+          newCode[#newCode + 1] = { op = "TESTORJMP", a = 0 } 
+          newCode[#newCode + 1] = { op = "JMP", a = #newCode + 3 } 
+          newCode[#newCode + 1] = { op = "POP", a = 1 }
+          newCode[testJmpIdx].a = #newCode + 1
+
+        elseif junkType == 3 then
+          
+          local pushOp = JUNK_PUSH_OPS[math.random(1, #JUNK_PUSH_OPS)]
+          newCode[#newCode + 1] = { op = pushOp }
+          newCode[#newCode + 1] = { op = "DUP" }
+          newCode[#newCode + 1] = { op = "POP", a = 1 }
+          newCode[#newCode + 1] = { op = "POP", a = 1 }
+        end
+      end
+
+      
+      map[i] = #newCode + 1
+      newCode[#newCode + 1] = old[i]
+    end
+
+    
+    map[#old + 1] = #newCode + 1
+
+    
+    for _, instr in ipairs(newCode) do
+      if JUMP_OPS[instr.op] then
+        if map[instr.a] then
+          instr.a = map[instr.a]
+        end
+      end
+    end
+
+    proto.code = newCode
+  end
+end
+
+return Junk
+interpreter.lua
+
+local Junk = {}
+
+local JUNK_PUSH_OPS = { "LOADNIL", "LOADTRUE", "LOADFALSE", "NEWTABLE" }
+
+local JUMP_OPS = {
+  JMP = true, JMPIFNOT = true, JMPIFNIL = true, TESTANDJMP = true, TESTORJMP = true,
+}
+
+local BINOPS_LIST = { "+", "-", "*", "/", "%", ".." }
+
+function Junk.inject(mod, rate)
+  rate = rate or 0.15
+  for _, proto in ipairs(mod.protos) do
+    local old = proto.code
+    local newCode = {}
+    local map = {}
+
+    for i = 1, #old do
+      local r = math.random()
+      
+      if r < rate then
+        local junkType = math.random(1, 3)
+
+        if junkType == 1 then
+          
+          newCode[#newCode + 1] = { op = "CPLX", a = math.random(0, 50), b = math.random(100, 999) }
+
+        elseif junkType == 2 then
+          
+          newCode[#newCode + 1] = { op = "LOADTRUE" }
+          local testJmpIdx = #newCode + 1
+          newCode[#newCode + 1] = { op = "TESTORJMP", a = 0 } 
+          newCode[#newCode + 1] = { op = "JMP", a = #newCode + 3 } 
+          newCode[#newCode + 1] = { op = "POP", a = 1 }
+          newCode[testJmpIdx].a = #newCode + 1
+
+        elseif junkType == 3 then
+          
+          local pushOp = JUNK_PUSH_OPS[math.random(1, #JUNK_PUSH_OPS)]
+          newCode[#newCode + 1] = { op = pushOp }
+          newCode[#newCode + 1] = { op = "DUP" }
+          newCode[#newCode + 1] = { op = "POP", a = 1 }
+          newCode[#newCode + 1] = { op = "POP", a = 1 }
+        end
+      end
+
+      
+      map[i] = #newCode + 1
+      newCode[#newCode + 1] = old[i]
+    end
+
+    
+    map[#old + 1] = #newCode + 1
+
+    
+    for _, instr in ipairs(newCode) do
+      if JUMP_OPS[instr.op] then
+        if map[instr.a] then
+          instr.a = map[instr.a]
+        end
+      end
+    end
+
+    proto.code = newCode
+  end
+end
+
+return Junk
+capture.lua
+
+local Capture = {}
+
+
+
+local function pushFrame(stack, funcDepth)
+
+  stack[#stack + 1] = { funcDepth = funcDepth, names = {} }
+
+  return stack[#stack]
+
+end
+
+local function popFrame(stack) stack[#stack] = nil end
+
+local function declare(stack, name) stack[#stack].names[name] = true end
+
+
+
+local function resolveAndMark(stack, name, currentFuncDepth, captured)
+
+  for i = #stack, 1, -1 do
+
+    local frame = stack[i]
+
+    if frame.names[name] then
+
+      if frame.funcDepth < currentFuncDepth then
+
+        captured[name] = true
+
+      end
+
+      return
+
+    end
+
+  end
+
+end
+
+
+
+local walkExpr, walkStat, walkBlockBare, walkBlockScoped, walkFunction
+
+
+
+function walkExpr(node, stack, depth, captured)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" then
+
+    -- Nothing
+
+  elseif kind == "Name" then
+
+    resolveAndMark(stack, node.name, depth, captured)
+
+  elseif kind == "Index" then
+
+    walkExpr(node.obj, stack, depth, captured)
+
+    walkExpr(node.key, stack, depth, captured)
+
+  elseif kind == "Paren" then
+
+    walkExpr(node.expr, stack, depth, captured)
+
+  elseif kind == "Table" then
+
+    for _, field in ipairs(node.fields) do
+
+      if field.type == "keyed" then walkExpr(field.key, stack, depth, captured) end
+
+      walkExpr(field.value, stack, depth, captured)
+
+    end
+
+  elseif kind == "Function" then
+
+    walkFunction(node, stack, depth, captured)
+
+  elseif kind == "Call" then
+
+    walkExpr(node.fn, stack, depth, captured)
+
+    for _, a in ipairs(node.args) do walkExpr(a, stack, depth, captured) end
+
+  elseif kind == "MethodCall" then
+
+    walkExpr(node.obj, stack, depth, captured)
+
+    for _, a in ipairs(node.args) do walkExpr(a, stack, depth, captured) end
+
+  elseif kind == "Binop" then
+
+    walkExpr(node.lhs, stack, depth, captured)
+
+    walkExpr(node.rhs, stack, depth, captured)
+
+  elseif kind == "Unop" then
+
+    walkExpr(node.operand, stack, depth, captured)
+
+  else
+
+    error("XenonSec capture: unknown expression kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+function walkFunction(node, stack, depth, captured)
+
+  local newDepth = depth + 1
+
+  pushFrame(stack, newDepth)
+
+  for _, p in ipairs(node.params) do declare(stack, p) end
+
+  walkBlockBare(node.body, stack, newDepth, captured)
+
+  popFrame(stack)
+
+end
+
+
+
+function walkStat(node, stack, depth, captured)
+
+  local kind = node.kind
+
+  if kind == "Local" then
+
+    for _, v in ipairs(node.values) do walkExpr(v, stack, depth, captured) end
+
+    for _, n in ipairs(node.names) do declare(stack, n) end
+
+  elseif kind == "LocalFunction" then
+
+    -- Declare FIRST so recursive calls inside func can resolve correctly
+
+    declare(stack, node.name)
+
+    walkExpr(node.func, stack, depth, captured)
+
+  elseif kind == "Assign" then
+
+    for _, v in ipairs(node.values) do walkExpr(v, stack, depth, captured) end
+
+    for _, tgt in ipairs(node.targets) do
+
+      if tgt.kind == "Name" then
+
+        resolveAndMark(stack, tgt.name, depth, captured)
+
+      else
+
+        walkExpr(tgt.obj, stack, depth, captured)
+
+        walkExpr(tgt.key, stack, depth, captured)
+
+      end
+
+    end
+
+  elseif kind == "ExprStat" then
+
+    walkExpr(node.expr, stack, depth, captured)
+
+  elseif kind == "Do" then
+
+    walkBlockScoped(node.body, stack, depth, captured)
+
+  elseif kind == "If" then
+
+    for _, clause in ipairs(node.clauses) do
+
+      walkExpr(clause.cond, stack, depth, captured)
+
+      walkBlockScoped(clause.body, stack, depth, captured)
+
+    end
+
+    if node.elseBody then walkBlockScoped(node.elseBody, stack, depth, captured) end
+
+  elseif kind == "While" then
+
+    walkExpr(node.cond, stack, depth, captured)
+
+    walkBlockScoped(node.body, stack, depth, captured)
+
+  elseif kind == "Repeat" then
+
+    pushFrame(stack, depth)
+
+    walkBlockBare(node.body, stack, depth, captured)
+
+    walkExpr(node.cond, stack, depth, captured)
+
+    popFrame(stack)
+
+  elseif kind == "NumericFor" then
+
+    walkExpr(node.start, stack, depth, captured)
+
+    walkExpr(node.limit, stack, depth, captured)
+
+    if node.step then walkExpr(node.step, stack, depth, captured) end
+
+    pushFrame(stack, depth)
+
+    declare(stack, node.var)
+
+    walkBlockBare(node.body, stack, depth, captured) -- Dùng Bare thay vì Scoped để tránh lặp Frame
+
+    popFrame(stack)
+
+  elseif kind == "GenericFor" then
+
+    for _, e in ipairs(node.exprs) do walkExpr(e, stack, depth, captured) end
+
+    pushFrame(stack, depth)
+
+    for _, n in ipairs(node.names) do declare(stack, n) end
+
+    walkBlockBare(node.body, stack, depth, captured)
+
+    popFrame(stack)
+
+  elseif kind == "Return" then
+
+    for _, a in ipairs(node.args) do walkExpr(a, stack, depth, captured) end
+
+  end
+
+end
+
+
+
+function walkBlockBare(block, stack, depth, captured)
+
+  for _, stat in ipairs(block.body) do walkStat(stat, stack, depth, captured) end
+
+end
+
+
+
+function walkBlockScoped(block, stack, depth, captured)
+
+  pushFrame(stack, depth)
+
+  walkBlockBare(block, stack, depth, captured)
+
+  popFrame(stack)
+
+end
+
+
+
+function Capture.analyze(ast)
+
+  local stack = {}
+
+  local captured = {}
+
+  pushFrame(stack, 1)
+
+  walkBlockBare(ast, stack, 1, captured)
+
+  popFrame(stack)
+
+  return captured
+
+end
+
+
+
+return Capture
+
+compiler.lua
+
+--------------------------------------------------------------------
+
+-- XenonSec :: compiler.lua (Hardened & Patched Version)
+
+-- Fixes: Multi-assign stack inversion, GenericFor var order & scope leak,
+
+--        Repeat-until scope unrolling, Vararg/Multi-return stack alignment.
+
+-- Security: Dynamic instruction mangling & Random Key Generation.
+
+--------------------------------------------------------------------
+
+
+
+local Compiler = {}
+
+
+
+local function getRandomByteString(len)
+
+	local t = {}
+
+	for i = 1, len or 8 do
+
+		t[i] = string.char(math.random(1, 255))
+
+	end
+
+	return table.concat(t)
+
+end
+
+
+
+local function newModule()
+
+	return {
+
+		consts = {},           -- Array of literal constants
+
+		constIndex = {},       -- Value -> index memoization
+
+		protos = {},           -- Array of function prototypes
+
+		mangledMap = {},       -- Obfuscated name mapping
+
+	}
+
+end
+
+
+
+-- Mã hóa tên hằng số / tên biến trước khi ghi vào Const Table
+
+local function addConst(mod, value)
+
+	local key = type(value) .. ":" .. tostring(value)
+
+	local existing = mod.constIndex[key]
+
+	if existing then return existing end
+
+
+
+	local finalVal = value
+
+	if type(value) == "string" and value:sub(1, 1) == "\1" then
+
+		-- Tên biến local đã rename: Biến thành chuỗi rác ngẫu nhiên
+
+		if not mod.mangledMap[value] then
+
+			mod.mangledMap[value] = "\1xs_" .. getRandomByteString(12)
+
+		end
+
+		finalVal = mod.mangledMap[value]
+
+	end
+
+
+
+	mod.consts[#mod.consts + 1] = finalVal
+
+	local idx = #mod.consts
+
+	mod.constIndex[key] = idx
+
+	return idx
+
+end
+
+
+
+local function newProto(mod, params, hasVararg)
+
+	mod.protos[#mod.protos + 1] = { params = params, nparams = #params, hasVararg = hasVararg, code = {} }
+
+	return #mod.protos
+
+end
+
+
+
+local function newCtx(mod, protoIndex)
+
+	return {
+
+		mod = mod,
+
+		protoIndex = protoIndex,
+
+		code = mod.protos[protoIndex].code,
+
+		loopStack = {},
+
+		tempCounter = 0,
+
+		scopeDepth = 0,
+
+		regMap = {},
+
+		nextReg = 0,
+
+	}
+
+end
+
+
+
+local function emit(ctx, op, a, b, c)
+
+	local code = ctx.code
+
+	code[#code + 1] = { op = op, a = a, b = b, c = c }
+
+	return #code
+
+end
+
+
+
+local function pushScope(ctx)
+
+	emit(ctx, "NEWSCOPE")
+
+	ctx.scopeDepth = ctx.scopeDepth + 1
+
+end
+
+
+
+local function popScope(ctx)
+
+	emit(ctx, "POPSCOPE")
+
+	ctx.scopeDepth = ctx.scopeDepth - 1
+
+end
+
+
+
+local function here(ctx) return #ctx.code + 1 end
+
+
+
+local function patchTo(ctx, idx, target)
+
+	ctx.code[idx].a = target
+
+end
+
+
+
+local function k(ctx, value) return addConst(ctx.mod, value) end
+
+
+
+local function tempName(ctx)
+
+	ctx.tempCounter = ctx.tempCounter + 1
+
+	return "\1__temp_" .. ctx.tempCounter .. "_" .. getRandomByteString(6)
+
+end
+
+
+
+local function isLocalToken(name)
+
+	return type(name) == "string" and name:sub(1, 1) == "\1"
+
+end
+
+
+
+local function isCaptured(ctx, name)
+
+	return ctx.mod.capturedSet ~= nil and ctx.mod.capturedSet[name] == true
+
+end
+
+
+
+local function regSlotFor(ctx, name)
+
+	local r = ctx.regMap[name]
+
+	if not r then
+
+		r = ctx.nextReg
+
+		ctx.nextReg = ctx.nextReg + 1
+
+		ctx.regMap[name] = r
+
+	end
+
+	return r
+
+end
+
+
+
+local function emitGet(ctx, name)
+
+	if isLocalToken(name) and not isCaptured(ctx, name) then
+
+		emit(ctx, "GETREG", regSlotFor(ctx, name))
+
+	else
+
+		emit(ctx, "GETVAR", k(ctx, name))
+
+	end
+
+end
+
+
+
+local function emitSet(ctx, name)
+
+	if isLocalToken(name) and not isCaptured(ctx, name) then
+
+		emit(ctx, "SETREG", regSlotFor(ctx, name))
+
+	else
+
+		emit(ctx, "SETVAR", k(ctx, name))
+
+	end
+
+end
+
+
+
+local function emitDeclare(ctx, name)
+
+	if isCaptured(ctx, name) then
+
+		emit(ctx, "DECLLOCAL", k(ctx, name))
+
+	else
+
+		emit(ctx, "SETREG", regSlotFor(ctx, name))
+
+	end
+
+end
+
+
+
+local function emitTempDeclare(ctx, name) emit(ctx, "SETREG", regSlotFor(ctx, name)) end
+
+local function emitTempGet(ctx, name) emit(ctx, "GETREG", regSlotFor(ctx, name)) end
+
+local function emitTempSet(ctx, name) emit(ctx, "SETREG", regSlotFor(ctx, name)) end
+
+
+
+--------------------------------------------------------------------
+
+-- Forward Declarations
+
+--------------------------------------------------------------------
+
+local compileExpr, compileStat, compileBlockScoped, compileBlockBare
+
+local compileExprListExactN, compileExprListVariadic, compileCallLike
+
+local compileNumericFor, compileGenericFor
+
+
+
+local function isMultiCapable(node)
+
+	return node.kind == "Call" or node.kind == "MethodCall" or node.kind == "Vararg"
+
+end
+
+
+
+function compileExprListVariadic(exprs, ctx)
+
+	if #exprs == 0 then return 0, false end
+
+	for i = 1, #exprs - 1 do
+
+		compileExpr(exprs[i], ctx, false)
+
+	end
+
+	local last = exprs[#exprs]
+
+	if isMultiCapable(last) then
+
+		compileExpr(last, ctx, true)
+
+		return #exprs - 1, true
+
+	else
+
+		compileExpr(last, ctx, false)
+
+		return #exprs, false
+
+	end
+
+end
+
+
+
+function compileExprListExactN(exprs, n, ctx)
+
+	if #exprs == 0 then
+
+		for _ = 1, n do emit(ctx, "LOADNIL") end
+
+		return
+
+	end
+
+	local fixedCount, hasTrailing = compileExprListVariadic(exprs, ctx)
+
+	local total
+
+	if hasTrailing then
+
+		local wanted = n - fixedCount
+
+		if wanted < 0 then wanted = 0 end
+
+		emit(ctx, "ADJUSTMULTI", wanted)
+
+		total = fixedCount + wanted
+
+	else
+
+		total = fixedCount
+
+	end
+
+	if total > n then
+
+		emit(ctx, "POP", total - n)
+
+	elseif total < n then
+
+		for _ = 1, n - total do emit(ctx, "LOADNIL") end
+
+	end
+
+end
+
+
+
+function compileCallLike(prefixCount, argExprs, ctx, resultMulti)
+
+	local fixedFromArgs, hasTrailing = compileExprListVariadic(argExprs, ctx)
+
+	local nargsStatic = prefixCount + fixedFromArgs
+
+	emit(ctx, "CALL", nargsStatic, hasTrailing and 1 or 0, resultMulti and 1 or 0)
+
+end
+
+
+
+function compileExpr(node, ctx, wantMulti)
+
+	local kind = node.kind
+
+	if kind == "Number" or kind == "String" then
+
+		emit(ctx, "LOADK", k(ctx, node.value))
+
+	elseif kind == "Nil" then
+
+		emit(ctx, "LOADNIL")
+
+	elseif kind == "True" then
+
+		emit(ctx, "LOADTRUE")
+
+	elseif kind == "False" then
+
+		emit(ctx, "LOADFALSE")
+
+	elseif kind == "Vararg" then
+
+		emit(ctx, wantMulti and "VARARGMULTI" or "VARARGONE")
+
+	elseif kind == "Name" then
+
+		emitGet(ctx, node.name)
+
+	elseif kind == "Index" then
+
+		compileExpr(node.obj, ctx, false)
+
+		compileExpr(node.key, ctx, false)
+
+		emit(ctx, "GETINDEX")
+
+	elseif kind == "Paren" then
+
+		compileExpr(node.expr, ctx, false)
+
+	elseif kind == "Table" then
+
+		emit(ctx, "NEWTABLE")
+
+		local autoIndex = 0
+
+		for i, field in ipairs(node.fields) do
+
+			local isLast = (i == #node.fields)
+
+			if field.type == "keyed" then
+
+				emit(ctx, "DUP")
+
+				compileExpr(field.key, ctx, false)
+
+				compileExpr(field.value, ctx, false)
+
+				emit(ctx, "SETINDEX")
+
+			else
+
+				if isLast and isMultiCapable(field.value) then
+
+					emit(ctx, "DUP")
+
+					compileExpr(field.value, ctx, true)
+
+					emit(ctx, "SETLIST", autoIndex)
+
+				else
+
+					autoIndex = autoIndex + 1
+
+					emit(ctx, "DUP")
+
+					emit(ctx, "LOADK", k(ctx, autoIndex))
+
+					compileExpr(field.value, ctx, false)
+
+					emit(ctx, "SETINDEX")
+
+				end
+
+			end
+
+		end
+
+	elseif kind == "Function" then
+
+		local protoIndex = newProto(ctx.mod, {}, node.hasVararg)
+
+		local subCtx = newCtx(ctx.mod, protoIndex)
+
+		local paramDescs = {}
+
+		for i, pname in ipairs(node.params) do
+
+			if isCaptured(subCtx, pname) then
+
+				paramDescs[i] = { reg = false, name = pname }
+
+			else
+
+				paramDescs[i] = { reg = true, slot = regSlotFor(subCtx, pname) }
+
+			end
+
+		end
+
+		ctx.mod.protos[protoIndex].params = paramDescs
+
+		ctx.mod.protos[protoIndex].nparams = #node.params
+
+		compileBlockBare(node.body, subCtx)
+
+		emit(subCtx, "RETURN", 0, 0)
+
+		emit(ctx, "CLOSURE", protoIndex)
+
+	elseif kind == "Call" then
+
+		compileExpr(node.fn, ctx, false)
+
+		compileCallLike(0, node.args, ctx, wantMulti and true or false)
+
+	elseif kind == "MethodCall" then
+
+		compileExpr(node.obj, ctx, false)
+
+		emit(ctx, "DUP")
+
+		emit(ctx, "LOADK", k(ctx, node.method))
+
+		emit(ctx, "GETINDEX")
+
+		emit(ctx, "SWAP")
+
+		compileCallLike(1, node.args, ctx, wantMulti and true or false)
+
+	elseif kind == "Binop" then
+
+		if node.op == "and" then
+
+			compileExpr(node.lhs, ctx, false)
+
+			local jmp = emit(ctx, "TESTANDJMP", 0)
+
+			emit(ctx, "POP", 1)
+
+			compileExpr(node.rhs, ctx, false)
+
+			patchTo(ctx, jmp, here(ctx))
+
+		elseif node.op == "or" then
+
+			compileExpr(node.lhs, ctx, false)
+
+			local jmp = emit(ctx, "TESTORJMP", 0)
+
+			emit(ctx, "POP", 1)
+
+			compileExpr(node.rhs, ctx, false)
+
+			patchTo(ctx, jmp, here(ctx))
+
+		else
+
+			compileExpr(node.lhs, ctx, false)
+
+			compileExpr(node.rhs, ctx, false)
+
+			emit(ctx, "BINOP", node.op)
+
+		end
+
+	elseif kind == "Unop" then
+
+		compileExpr(node.operand, ctx, false)
+
+		emit(ctx, "UNOP", node.op)
+
+	else
+
+		error("XenonSec compiler: unknown expression kind '" .. tostring(kind) .. "'")
+
+	end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- FIX LOGIC GÁN ĐA BIẾN (ASSIGNMENT FIX)
+
+--------------------------------------------------------------------
+
+local function compileAssignTargets(targets, ctx, declMode)
+
+	-- Dùng Register tạm để buffer các giá trị từ Stack trước khi gán
+
+	-- Tránh lỗi đảo giá trị khi gán a, b = b, a
+
+	local temps = {}
+
+	for i = #targets, 1, -1 do
+
+		local tReg = tempName(ctx)
+
+		emitTempDeclare(ctx, tReg)
+
+		temps[i] = tReg
+
+	end
+
+
+
+	for i = 1, #targets do
+
+		local tgt = targets[i]
+
+		emitTempGet(ctx, temps[i])
+
+		if declMode then
+
+			emitDeclare(ctx, tgt)
+
+		else
+
+			if type(tgt) == "string" or tgt.kind == "Name" then
+
+				local name = type(tgt) == "string" and tgt or tgt.name
+
+				emitSet(ctx, name)
+
+			else -- Index target
+
+				compileExpr(tgt.obj, ctx, false)
+
+				compileExpr(tgt.key, ctx, false)
+
+				emitTempGet(ctx, temps[i])
+
+				emit(ctx, "SETINDEX")
+
+			end
+
+		end
+
+	end
+
+end
+
+
+
+function compileStat(node, ctx)
+
+	local kind = node.kind
+
+	if kind == "Local" then
+
+		compileExprListExactN(node.values, #node.names, ctx)
+
+		compileAssignTargets(node.names, ctx, true)
+
+	elseif kind == "LocalFunction" then
+
+		emit(ctx, "LOADNIL")
+
+		emitDeclare(ctx, node.name)
+
+		compileExpr(node.func, ctx, false)
+
+		emitSet(ctx, node.name)
+
+	elseif kind == "Assign" then
+
+		compileExprListExactN(node.values, #node.targets, ctx)
+
+		compileAssignTargets(node.targets, ctx, false)
+
+	elseif kind == "ExprStat" then
+
+		compileExpr(node.expr, ctx, false)
+
+		emit(ctx, "POP", 1)
+
+	elseif kind == "Do" then
+
+		compileBlockScoped(node.body, ctx)
+
+	elseif kind == "If" then
+
+		local endJumps = {}
+
+		for _, clause in ipairs(node.clauses) do
+
+			compileExpr(clause.cond, ctx, false)
+
+			local skip = emit(ctx, "JMPIFNOT", 0)
+
+			compileBlockScoped(clause.body, ctx)
+
+			endJumps[#endJumps + 1] = emit(ctx, "JMP", 0)
+
+			patchTo(ctx, skip, here(ctx))
+
+		end
+
+		if node.elseBody then
+
+			compileBlockScoped(node.elseBody, ctx)
+
+		end
+
+		local endHere = here(ctx)
+
+		for _, j in ipairs(endJumps) do patchTo(ctx, j, endHere) end
+
+	elseif kind == "While" then
+
+		local top = here(ctx)
+
+		compileExpr(node.cond, ctx, false)
+
+		local exit = emit(ctx, "JMPIFNOT", 0)
+
+		ctx.loopStack[#ctx.loopStack + 1] = { breaks = {}, continues = {}, baseDepth = ctx.scopeDepth, continueBaseDepth = ctx.scopeDepth }
+
+		compileBlockScoped(node.body, ctx)
+
+		local continueHere = here(ctx)
+
+		emit(ctx, "JMP", top)
+
+		local endHere = here(ctx)
+
+		patchTo(ctx, exit, endHere)
+
+		local loop = table.remove(ctx.loopStack)
+
+		for _, j in ipairs(loop.breaks) do patchTo(ctx, j, endHere) end
+
+		for _, j in ipairs(loop.continues) do patchTo(ctx, j, continueHere) end
+
+	elseif kind == "Repeat" then
+
+		local top = here(ctx)
+
+		local baseDepthForBreak = ctx.scopeDepth
+
+		pushScope(ctx)
+
+		ctx.loopStack[#ctx.loopStack + 1] = { breaks = {}, continues = {}, baseDepth = baseDepthForBreak, continueBaseDepth = ctx.scopeDepth }
+
+		compileBlockBare(node.body, ctx)
+
+		local continueHere = here(ctx)
+
+		compileExpr(node.cond, ctx, false)
+
+		popScope(ctx)
+
+		emit(ctx, "JMPIFNOT", top)
+
+		local endHere = here(ctx)
+
+		local loop = table.remove(ctx.loopStack)
+
+		for _, j in ipairs(loop.breaks) do patchTo(ctx, j, endHere) end
+
+		for _, j in ipairs(loop.continues) do patchTo(ctx, j, continueHere) end
+
+	elseif kind == "Break" or kind == "Continue" then
+
+		if #ctx.loopStack == 0 then error("XenonSec: break/continue outside loop") end
+
+		local loop = ctx.loopStack[#ctx.loopStack]
+
+		local targetDepth = (kind == "Break") and loop.baseDepth or loop.continueBaseDepth
+
+		for _ = 1, ctx.scopeDepth - targetDepth do
+
+			emit(ctx, "POPSCOPE")
+
+		end
+
+		local j = emit(ctx, "JMP", 0)
+
+		if kind == "Break" then
+
+			loop.breaks[#loop.breaks + 1] = j
+
+		else
+
+			loop.continues[#loop.continues + 1] = j
+
+		end
+
+	elseif kind == "NumericFor" then
+
+		compileNumericFor(node, ctx)
+
+	elseif kind == "GenericFor" then
+
+		compileGenericFor(node, ctx)
+
+	elseif kind == "Return" then
+
+		local fixedCount, hasTrailing = compileExprListVariadic(node.args, ctx)
+
+		emit(ctx, "RETURN", fixedCount, hasTrailing and 1 or 0)
+
+	else
+
+		error("XenonSec compiler: unknown statement kind '" .. tostring(kind) .. "'")
+
+	end
+
+end
+
+
+
+function compileNumericFor(node, ctx)
+
+	local startT, limitT, stepT, counterT = tempName(ctx), tempName(ctx), tempName(ctx), tempName(ctx)
+
+	local varName = node.var
+
+
+
+	pushScope(ctx)
+
+	compileExpr(node.start, ctx, false); emitTempDeclare(ctx, startT)
+
+	compileExpr(node.limit, ctx, false); emitTempDeclare(ctx, limitT)
+
+	if node.step then compileExpr(node.step, ctx, false) else emit(ctx, "LOADK", k(ctx, 1)) end
+
+	emitTempDeclare(ctx, stepT)
+
+	emitTempGet(ctx, startT)
+
+	emitTempDeclare(ctx, counterT)
+
+
+
+	local top = here(ctx)
+
+	emitTempGet(ctx, stepT); emit(ctx, "LOADK", k(ctx, 0)); emit(ctx, "BINOP", ">")
+
+	local elseJ = emit(ctx, "JMPIFNOT", 0)
+
+	emitTempGet(ctx, counterT); emitTempGet(ctx, limitT); emit(ctx, "BINOP", "<=")
+
+	local doneJ = emit(ctx, "JMP", 0)
+
+	patchTo(ctx, elseJ, here(ctx))
+
+	emitTempGet(ctx, counterT); emitTempGet(ctx, limitT); emit(ctx, "BINOP", ">=")
+
+	patchTo(ctx, doneJ, here(ctx))
+
+	local exit = emit(ctx, "JMPIFNOT", 0)
+
+
+
+	ctx.loopStack[#ctx.loopStack + 1] = { breaks = {}, continues = {}, baseDepth = ctx.scopeDepth, continueBaseDepth = ctx.scopeDepth }
+
+	pushScope(ctx)
+
+	emitTempGet(ctx, counterT); emitDeclare(ctx, varName)
+
+	compileBlockBare(node.body, ctx)
+
+	popScope(ctx)
+
+	local continueHere = here(ctx)
+
+	emitTempGet(ctx, counterT); emitTempGet(ctx, stepT); emit(ctx, "BINOP", "+")
+
+	emitTempSet(ctx, counterT)
+
+	emit(ctx, "JMP", top)
+
+
+
+	local endHere = here(ctx)
+
+	patchTo(ctx, exit, endHere)
+
+	local loop = table.remove(ctx.loopStack)
+
+	for _, j in ipairs(loop.breaks) do patchTo(ctx, j, endHere) end
+
+	for _, j in ipairs(loop.continues) do patchTo(ctx, j, continueHere) end
+
+	popScope(ctx)
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- FIX LOGIC GENERIC FOR (SWAP VARIABLES & SCOPE CLEANUP)
+
+--------------------------------------------------------------------
+
+function compileGenericFor(node, ctx)
+
+	local fT, sT, cT = tempName(ctx), tempName(ctx), tempName(ctx)
+
+	pushScope(ctx)
+
+	compileExprListExactN(node.exprs, 3, ctx)
+
+	emitTempDeclare(ctx, cT)
+
+	emitTempDeclare(ctx, sT)
+
+	emitTempDeclare(ctx, fT)
+
+
+
+	local top = here(ctx)
+
+	emitTempGet(ctx, fT)
+
+	emitTempGet(ctx, sT)
+
+	emitTempGet(ctx, cT)
+
+	emit(ctx, "CALL", 2, 0, 1)
+
+	emit(ctx, "ADJUSTMULTI", #node.names)
+
+	
+
+	local continueBaseDepth = ctx.scopeDepth
+
+	pushScope(ctx)
+
+	
+
+	-- FIX: Gán đúng thứ tự các biến iterator trả về
+
+	compileAssignTargets(node.names, ctx, true)
+
+	
+
+	emitGet(ctx, node.names[1])
+
+	local exit = emit(ctx, "JMPIFNIL", 0)
+
+	emitGet(ctx, node.names[1])
+
+	emitTempSet(ctx, cT)
+
+
+
+	ctx.loopStack[#ctx.loopStack + 1] = { breaks = {}, continues = {}, baseDepth = ctx.scopeDepth, continueBaseDepth = continueBaseDepth }
+
+	compileBlockBare(node.body, ctx)
+
+	popScope(ctx)
+
+	
+
+	local continueHere = here(ctx)
+
+	emit(ctx, "JMP", top)
+
+
+
+	local endHere = here(ctx)
+
+	patchTo(ctx, exit, endHere)
+
+	popScope(ctx) -- FIX: Cleanup scope nếu JMPIFNIL nhảy thoát
+
+	
+
+	local loop = table.remove(ctx.loopStack)
+
+	for _, j in ipairs(loop.breaks) do patchTo(ctx, j, endHere) end
+
+	for _, j in ipairs(loop.continues) do patchTo(ctx, j, continueHere) end
+
+	popScope(ctx)
+
+end
+
+
+
+function compileBlockBare(block, ctx)
+
+	for _, stat in ipairs(block.body) do compileStat(stat, ctx) end
+
+end
+
+
+
+function compileBlockScoped(block, ctx)
+
+	pushScope(ctx)
+
+	compileBlockBare(block, ctx)
+
+	popScope(ctx)
+
+end
+
+
+
+function Compiler.compile(ast, capturedSet)
+
+	local mod = newModule()
+
+	mod.capturedSet = capturedSet or {}
+
+	local mainProto = newProto(mod, {}, true)
+
+	local ctx = newCtx(mod, mainProto)
+
+	compileBlockBare(ast, ctx)
+
+	emit(ctx, "RETURN", 0, 0)
+
+	mod.mainProto = mainProto
+
+	return mod
+
+end
+
+
+
+return Compiler
+
+renamer.lua
+
+--------------------------------------------------------------------
+-- XenonSec :: renamer.lua
+-- Walks the AST performing REAL static lexical scope resolution
+-- (mirroring Lua's binding rules exactly, including closures) and
+-- replaces every identifier that resolves to a local binding with a
+-- fresh, unique, meaningless token. Identifiers that never resolve to
+-- a local anywhere in their scope chain are left completely alone,
+-- since they must remain the real global name (e.g. "print", "pairs",
+-- a global module table, etc).
+--
+-- This is a pure alpha-renaming pass: it never changes program
+-- behaviour. It only strips away meaningful source identifiers so the
+-- compiled bytecode/constant pool that follows contains no trace of
+-- the original variable names.
+--------------------------------------------------------------------
+
+local Renamer = {}
+
+local counter = 0
+local function freshToken()
+  counter = counter + 1
+  return "\1xs" .. counter -- \1 prefix: cannot collide with any valid Lua source identifier or global name
+end
+
+local function pushFrame(stack)
+  stack[#stack + 1] = {}
+  return stack[#stack]
+end
+
+local function popFrame(stack)
+  stack[#stack] = nil
+end
+
+local function declare(stack, name)
+  local tok = freshToken()
+  stack[#stack][name] = tok
+  return tok
+end
+
+local function lookup(stack, name)
+  for i = #stack, 1, -1 do
+    local tok = stack[i][name]
+    if tok then return tok end
+  end
+  return nil
+end
+
+local resolveExpr, resolveStat, resolveBlockBare, resolveBlockScoped, resolveFunction
+
+function resolveExpr(node, stack)
+  local kind = node.kind
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+    or kind == "False" or kind == "Vararg" then
+    -- nothing to resolve
+  elseif kind == "Name" then
+    local tok = lookup(stack, node.name)
+    if tok then node.name = tok end -- else: genuine global, leave spelling untouched
+  elseif kind == "Index" then
+    resolveExpr(node.obj, stack)
+    resolveExpr(node.key, stack) -- dot-keys are String literals already; bracket-keys are real exprs
+  elseif kind == "Paren" then
+    resolveExpr(node.expr, stack)
+  elseif kind == "Table" then
+    for _, field in ipairs(node.fields) do
+      if field.type == "keyed" then
+        resolveExpr(field.key, stack)
+        resolveExpr(field.value, stack)
+      else
+        resolveExpr(field.value, stack)
+      end
+    end
+  elseif kind == "Function" then
+    resolveFunction(node, stack)
+  elseif kind == "Call" then
+    resolveExpr(node.fn, stack)
+    for _, a in ipairs(node.args) do resolveExpr(a, stack) end
+  elseif kind == "MethodCall" then
+    resolveExpr(node.obj, stack)
+    for _, a in ipairs(node.args) do resolveExpr(a, stack) end
+  elseif kind == "Binop" then
+    resolveExpr(node.lhs, stack)
+    resolveExpr(node.rhs, stack)
+  elseif kind == "Unop" then
+    resolveExpr(node.operand, stack)
+  else
+    error("XenonSec renamer: unknown expression kind '" .. tostring(kind) .. "'")
+  end
+end
+
+-- Function body gets exactly one fresh frame that holds its params;
+-- the body's own statements share that same frame unless a nested
+-- block introduces its own (matching compiler.lua's compileBlockBare).
+function resolveFunction(node, stack)
+  pushFrame(stack)
+  for i, pname in ipairs(node.params) do
+    node.params[i] = declare(stack, pname)
+  end
+  resolveBlockBare(node.body, stack)
+  popFrame(stack)
+end
+
+function resolveStat(node, stack)
+  local kind = node.kind
+  if kind == "Local" then
+    for _, v in ipairs(node.values) do resolveExpr(v, stack) end
+    for i, n in ipairs(node.names) do node.names[i] = declare(stack, n) end
+  elseif kind == "LocalFunction" then
+    node.name = declare(stack, node.name)
+    resolveExpr(node.func, stack)
+  elseif kind == "Assign" then
+    for _, v in ipairs(node.values) do resolveExpr(v, stack) end
+    for _, tgt in ipairs(node.targets) do
+      if tgt.kind == "Name" then
+        local tok = lookup(stack, tgt.name)
+        if tok then tgt.name = tok end
+      else
+        resolveExpr(tgt.obj, stack)
+        resolveExpr(tgt.key, stack)
+      end
+    end
+  elseif kind == "ExprStat" then
+    resolveExpr(node.expr, stack)
+  elseif kind == "Do" then
+    resolveBlockScoped(node.body, stack)
+  elseif kind == "If" then
+    for _, clause in ipairs(node.clauses) do
+      resolveExpr(clause.cond, stack)
+      resolveBlockScoped(clause.body, stack)
+    end
+    if node.elseBody then resolveBlockScoped(node.elseBody, stack) end
+  elseif kind == "While" then
+    resolveExpr(node.cond, stack)
+    resolveBlockScoped(node.body, stack)
+  elseif kind == "Repeat" then
+    -- body and the `until` condition share one scope (until can see body locals)
+    pushFrame(stack)
+    resolveBlockBare(node.body, stack)
+    resolveExpr(node.cond, stack)
+    popFrame(stack)
+  elseif kind == "Break" then
+    -- nothing
+  elseif kind == "Continue" then
+    -- nothing (compiler.lua handles jump targets)
+  elseif kind == "NumericFor" then
+    resolveExpr(node.start, stack)
+    resolveExpr(node.limit, stack)
+    if node.step then resolveExpr(node.step, stack) end
+    pushFrame(stack)
+    node.var = declare(stack, node.var)
+    resolveBlockScoped(node.body, stack)
+    popFrame(stack)
+  elseif kind == "GenericFor" then
+    for _, e in ipairs(node.exprs) do resolveExpr(e, stack) end
+    pushFrame(stack)
+    for i, n in ipairs(node.names) do node.names[i] = declare(stack, n) end
+    resolveBlockBare(node.body, stack)
+    popFrame(stack)
+  elseif kind == "Return" then
+    for _, a in ipairs(node.args) do resolveExpr(a, stack) end
+  else
+    error("XenonSec renamer: unknown statement kind '" .. tostring(kind) .. "'")
+  end
+end
+
+function resolveBlockBare(block, stack)
+  for _, stat in ipairs(block.body) do resolveStat(stat, stack) end
+end
+
+function resolveBlockScoped(block, stack)
+  pushFrame(stack)
+  resolveBlockBare(block, stack)
+  popFrame(stack)
+end
+
+-- Public entry point. Mutates and returns the same AST.
+function Renamer.resolve(ast)
+  local stack = {}
+  pushFrame(stack) -- main chunk acts like a vararg function with no params
+  resolveBlockBare(ast, stack)
+  popFrame(stack)
+  return ast
+end
+
+return Renamer
+ssa.lua
+
+--------------------------------------------------------------------
+
+-- XenonSec :: ssa.lua
+
+-- A real SSA-flavored optimizer, scoped honestly:
+
+--
+
+--   * Every `local x = <pure expr>` is treated as x's single static
+
+--     definition (true SSA discipline: one name, one value, for as
+
+--     long as it isn't reassigned or captured by a closure).
+
+--   * That value is VALUE-NUMBERED: as long as it stays live and
+
+--     un-reassigned, every subsequent read of x within the same
+
+--     straight-line run of statements is replaced with a copy of its
+
+--     recorded value expression (copy propagation / constant
+
+--     propagation).
+
+--   * If x is never read again before it goes out of scope, the
+
+--     declaration is dead-code-eliminated -- its side-effecting RHS
+
+--     (if any) is kept as a bare statement, a side-effect-free RHS is
+
+--     dropped entirely.
+
+--
+
+-- What this deliberately does NOT do: build phi-functions at the
+
+-- merge points of if/while/for (that's full whole-function SSA with
+
+-- control-flow-graph construction -- a materially bigger project).
+
+-- Every nested control-flow construct (if/while/for/repeat/do/
+
+-- function) is treated as an opacity barrier: propagation never
+
+-- crosses into or out of one. This is what keeps the pass simple
+
+-- *and* unconditionally safe -- it only ever reasons about code that
+
+-- really does execute as one straight, unbranching sequence.
+
+--
+
+-- Run this AFTER fold.lua (so literal arithmetic is already reduced)
+
+-- and run fold.lua again afterward (propagating a copied literal into
+
+-- an expression frequently creates new foldable arithmetic).
+
+--------------------------------------------------------------------
+
+
+
+local SSA = {}
+
+
+
+--------------------------------------------------------------------
+
+-- Global captured-variable set (from capture.lua, computed once on the
+
+-- pristine pre-transform AST). A function call ANYWHERE can, through a
+
+-- closure that captured one of these names, mutate it -- even if no
+
+-- call is textually visible between the tracked definition and the
+
+-- current point. Any statement containing a call must therefore
+
+-- invalidate every tracked value for a name that's ever captured
+
+-- anywhere in the program. Names that are NEVER captured by any
+
+-- closure can't be touched this way (nothing else holds a reference to
+
+-- them), so they stay safely trackable across calls.
+
+--------------------------------------------------------------------
+
+
+
+local capturedNames = {}
+
+
+
+local function exprContainsCall(node)
+
+  local kind = node.kind
+
+  if kind == "Call" or kind == "MethodCall" then return true end
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" or kind == "Name" or kind == "Function" then
+
+    return false
+
+  elseif kind == "Index" then
+
+    return exprContainsCall(node.obj) or exprContainsCall(node.key)
+
+  elseif kind == "Paren" then
+
+    return exprContainsCall(node.expr)
+
+  elseif kind == "Table" then
+
+    for _, f in ipairs(node.fields) do
+
+      if f.type == "keyed" and exprContainsCall(f.key) then return true end
+
+      if exprContainsCall(f.value) then return true end
+
+    end
+
+    return false
+
+  elseif kind == "Binop" then
+
+    return exprContainsCall(node.lhs) or exprContainsCall(node.rhs)
+
+  elseif kind == "Unop" then
+
+    return exprContainsCall(node.operand)
+
+  end
+
+  return false
+
+end
+
+
+
+local function listContainsCall(list)
+
+  for _, e in ipairs(list) do if exprContainsCall(e) then return true end end
+
+  return false
+
+end
+
+
+
+local function statementContainsCall(s)
+
+  local kind = s.kind
+
+  if kind == "Local" or kind == "Return" then
+
+    return listContainsCall(s.values or s.args)
+
+  elseif kind == "LocalFunction" then
+
+    return false -- defining a closure doesn't call it
+
+  elseif kind == "Assign" then
+
+    if listContainsCall(s.values) then return true end
+
+    for _, t in ipairs(s.targets) do
+
+      if t.kind == "Index" and (exprContainsCall(t.obj) or exprContainsCall(t.key)) then return true end
+
+    end
+
+    return false
+
+  elseif kind == "ExprStat" then
+
+    return exprContainsCall(s.expr)
+
+  elseif kind == "If" then
+
+    for _, c in ipairs(s.clauses) do if exprContainsCall(c.cond) then return true end end
+
+    return false
+
+  elseif kind == "While" then
+
+    return exprContainsCall(s.cond)
+
+  elseif kind == "NumericFor" then
+
+    if exprContainsCall(s.start) or exprContainsCall(s.limit) then return true end
+
+    if s.step and exprContainsCall(s.step) then return true end
+
+    return false
+
+  elseif kind == "GenericFor" then
+
+    return listContainsCall(s.exprs)
+
+  end
+
+  return false
+
+end
+
+
+
+local function invalidateCapturedAfterCall(s, env)
+
+  if statementContainsCall(s) then
+
+    for name in pairs(capturedNames) do env[name] = nil end
+
+  end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Deep-copy of an expression subtree (needed because we splice the
+
+-- same "known value" into multiple use sites).
+
+--------------------------------------------------------------------
+
+
+
+local function cloneExpr(node)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" then
+
+    return { kind = kind, value = node.value, line = node.line }
+
+  elseif kind == "Name" then
+
+    return { kind = "Name", name = node.name, line = node.line }
+
+  elseif kind == "Binop" then
+
+    return { kind = "Binop", op = node.op, lhs = cloneExpr(node.lhs), rhs = cloneExpr(node.rhs), line = node.line }
+
+  elseif kind == "Unop" then
+
+    return { kind = "Unop", op = node.op, operand = cloneExpr(node.operand), line = node.line }
+
+  elseif kind == "Paren" then
+
+    return { kind = "Paren", expr = cloneExpr(node.expr), line = node.line }
+
+  else
+
+    error("XenonSec ssa: cloneExpr called on non-clonable kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+-- Only these shapes are ever tracked as a "known SSA value": literals,
+
+-- and pure arithmetic/concat/unary combinations of already-tracked
+
+-- values. Tables, function literals, calls, indexing, etc. are never
+
+-- tracked -- too easy to get aliasing/mutation/side-effects wrong.
+
+local PURE_BINOPS = {
+
+  ["+"] = true, ["-"] = true, ["*"] = true, ["/"] = true, ["%"] = true, ["^"] = true, [".."] = true,
+
+}
+
+
+
+local function isTrackable(node)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True" or kind == "False" then
+
+    return true
+
+  elseif kind == "Binop" then
+
+    return PURE_BINOPS[node.op] and isTrackable(node.lhs) and isTrackable(node.rhs)
+
+  elseif kind == "Unop" then
+
+    return (node.op == "-" or node.op == "#") and isTrackable(node.operand)
+
+  else
+
+    return false
+
+  end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Substitute tracked names into an expression (copy/constant
+
+-- propagation), returning a possibly-new node.
+
+--------------------------------------------------------------------
+
+
+
+local substExpr
+
+
+
+local function substList(list, env)
+
+  for i, e in ipairs(list) do list[i] = substExpr(e, env) end
+
+end
+
+
+
+function substExpr(node, env)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" then
+
+    return node
+
+  elseif kind == "Name" then
+
+    local known = env[node.name]
+
+    if known then return cloneExpr(known) end
+
+    return node
+
+  elseif kind == "Index" then
+
+    node.obj = substExpr(node.obj, env)
+
+    node.key = substExpr(node.key, env)
+
+    return node
+
+  elseif kind == "Paren" then
+
+    node.expr = substExpr(node.expr, env)
+
+    return node
+
+  elseif kind == "Table" then
+
+    for _, field in ipairs(node.fields) do
+
+      if field.type == "keyed" then field.key = substExpr(field.key, env) end
+
+      field.value = substExpr(field.value, env)
+
+    end
+
+    return node
+
+  elseif kind == "Function" then
+
+    -- opacity barrier: do NOT propagate current values into a nested
+
+    -- function body (it may run later, after the values here change).
+
+    return node
+
+  elseif kind == "Call" then
+
+    node.fn = substExpr(node.fn, env)
+
+    substList(node.args, env)
+
+    return node
+
+  elseif kind == "MethodCall" then
+
+    node.obj = substExpr(node.obj, env)
+
+    substList(node.args, env)
+
+    return node
+
+  elseif kind == "Binop" then
+
+    node.lhs = substExpr(node.lhs, env)
+
+    node.rhs = substExpr(node.rhs, env)
+
+    return node
+
+  elseif kind == "Unop" then
+
+    node.operand = substExpr(node.operand, env)
+
+    return node
+
+  else
+
+    error("XenonSec ssa: unknown expression kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Does `name` occur as a READ (expression-position Name, including
+
+-- inside nested control-flow and function bodies) anywhere in this
+
+-- list of statements? Assignment TARGETS (the `x` in `x = ...`) don't
+
+-- count as a read; everything else that mentions the name does.
+
+--------------------------------------------------------------------
+
+
+
+local exprHasRead, statHasRead, blockHasRead
+
+local optimizeBlock, sliceFrom, restOfBlockCaptures, statMentionsInsideFunction, blockMentionsName
+
+local collectAssignTargetsExpr, collectAssignTargetsStat, collectAssignTargetsBlock
+
+
+
+local function listHasRead(list, name)
+
+  for _, e in ipairs(list) do if exprHasRead(e, name) then return true end end
+
+  return false
+
+end
+
+
+
+function exprHasRead(node, name)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" then
+
+    return false
+
+  elseif kind == "Name" then
+
+    return node.name == name
+
+  elseif kind == "Index" then
+
+    return exprHasRead(node.obj, name) or exprHasRead(node.key, name)
+
+  elseif kind == "Paren" then
+
+    return exprHasRead(node.expr, name)
+
+  elseif kind == "Table" then
+
+    for _, field in ipairs(node.fields) do
+
+      if field.type == "keyed" and exprHasRead(field.key, name) then return true end
+
+      if exprHasRead(field.value, name) then return true end
+
+    end
+
+    return false
+
+  elseif kind == "Function" then
+
+    -- a closure that reads `name` keeps it alive (it's captured as an
+
+    -- upvalue -- eliminating/propagating past this point is unsafe).
+
+    return blockHasRead(node.body, name)
+
+  elseif kind == "Call" then
+
+    if exprHasRead(node.fn, name) then return true end
+
+    return listHasRead(node.args, name)
+
+  elseif kind == "MethodCall" then
+
+    if exprHasRead(node.obj, name) then return true end
+
+    return listHasRead(node.args, name)
+
+  elseif kind == "Binop" then
+
+    return exprHasRead(node.lhs, name) or exprHasRead(node.rhs, name)
+
+  elseif kind == "Unop" then
+
+    return exprHasRead(node.operand, name)
+
+  else
+
+    error("XenonSec ssa: unknown expression kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+function statHasRead(node, name)
+
+  local kind = node.kind
+
+  if kind == "Local" then
+
+    return listHasRead(node.values, name)
+
+  elseif kind == "LocalFunction" then
+
+    return exprHasRead(node.func, name)
+
+  elseif kind == "Assign" then
+
+    if listHasRead(node.values, name) then return true end
+
+    for _, tgt in ipairs(node.targets) do
+
+      if tgt.kind == "Index" and exprHasRead(tgt, name) then return true end
+
+    end
+
+    return false
+
+  elseif kind == "ExprStat" then
+
+    return exprHasRead(node.expr, name)
+
+  elseif kind == "Do" then
+
+    return blockHasRead(node.body, name)
+
+  elseif kind == "If" then
+
+    for _, clause in ipairs(node.clauses) do
+
+      if exprHasRead(clause.cond, name) or blockHasRead(clause.body, name) then return true end
+
+    end
+
+    if node.elseBody and blockHasRead(node.elseBody, name) then return true end
+
+    return false
+
+  elseif kind == "While" then
+
+    return exprHasRead(node.cond, name) or blockHasRead(node.body, name)
+
+  elseif kind == "Repeat" then
+
+    return blockHasRead(node.body, name) or exprHasRead(node.cond, name)
+
+  elseif kind == "Break" then
+
+    return false
+
+  elseif kind == "Continue" then
+
+    return false
+
+  elseif kind == "NumericFor" then
+
+    if exprHasRead(node.start, name) or exprHasRead(node.limit, name) then return true end
+
+    if node.step and exprHasRead(node.step, name) then return true end
+
+    return blockHasRead(node.body, name)
+
+  elseif kind == "GenericFor" then
+
+    if listHasRead(node.exprs, name) then return true end
+
+    return blockHasRead(node.body, name)
+
+  elseif kind == "Return" then
+
+    return listHasRead(node.args, name)
+
+  else
+
+    error("XenonSec ssa: unknown statement kind '" .. tostring(kind) .. "'")
+
+  end
+
+end
+
+
+
+function blockHasRead(block, name)
+
+  for _, s in ipairs(block.body) do
+
+    if statHasRead(s, name) then return true end
+
+  end
+
+  return false
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Is an expression free of observable side effects, so that a dead
+
+-- assignment's RHS can be dropped entirely rather than kept as a bare
+
+-- statement? Conservative: only literals/Name reads/pure arithmetic
+
+-- qualify (a Call might do I/O, error, mutate something -- always
+
+-- keep it).
+
+--------------------------------------------------------------------
+
+
+
+local function isSideEffectFree(node)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" or kind == "Name" then
+
+    return true
+
+  elseif kind == "Paren" then
+
+    return isSideEffectFree(node.expr)
+
+  elseif kind == "Binop" then
+
+    return isSideEffectFree(node.lhs) and isSideEffectFree(node.rhs)
+
+  elseif kind == "Unop" then
+
+    return isSideEffectFree(node.operand)
+
+  else
+
+    return false -- Index (metamethods), Table, Call, MethodCall, Function: assume effectful
+
+  end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- Optimize one straight-line block. Recurses into nested blocks with
+
+-- their own fresh (empty) environment, since propagation never
+
+-- crosses a control-flow barrier.
+
+--------------------------------------------------------------------
+
+
+
+local function recurseIntoNestedBlocks(stat)
+
+  local kind = stat.kind
+
+  if kind == "Do" then
+
+    optimizeBlock(stat.body)
+
+  elseif kind == "If" then
+
+    for _, clause in ipairs(stat.clauses) do optimizeBlock(clause.body) end
+
+    if stat.elseBody then optimizeBlock(stat.elseBody) end
+
+  elseif kind == "While" then
+
+    optimizeBlock(stat.body)
+
+  elseif kind == "Repeat" then
+
+    optimizeBlock(stat.body)
+
+  elseif kind == "NumericFor" then
+
+    optimizeBlock(stat.body)
+
+  elseif kind == "GenericFor" then
+
+    optimizeBlock(stat.body)
+
+  elseif kind == "LocalFunction" then
+
+    if stat.func.kind == "Function" then optimizeBlock(stat.func.body) end
+
+  end
+
+  -- Function-literal RHS values inside Local/Assign/ExprStat/Return/Table
+
+  -- are reached via a generic sweep below (walkFunctionsIn), since they
+
+  -- can appear anywhere an expression can.
+
+end
+
+
+
+local function walkFunctionsInExpr(node)
+
+  local kind = node.kind
+
+  if kind == "Function" then
+
+    optimizeBlock(node.body)
+
+  elseif kind == "Index" then
+
+    walkFunctionsInExpr(node.obj); walkFunctionsInExpr(node.key)
+
+  elseif kind == "Paren" then
+
+    walkFunctionsInExpr(node.expr)
+
+  elseif kind == "Table" then
+
+    for _, f in ipairs(node.fields) do
+
+      if f.type == "keyed" then walkFunctionsInExpr(f.key) end
+
+      walkFunctionsInExpr(f.value)
+
+    end
+
+  elseif kind == "Call" then
+
+    walkFunctionsInExpr(node.fn)
+
+    for _, a in ipairs(node.args) do walkFunctionsInExpr(a) end
+
+  elseif kind == "MethodCall" then
+
+    walkFunctionsInExpr(node.obj)
+
+    for _, a in ipairs(node.args) do walkFunctionsInExpr(a) end
+
+  elseif kind == "Binop" then
+
+    walkFunctionsInExpr(node.lhs); walkFunctionsInExpr(node.rhs)
+
+  elseif kind == "Unop" then
+
+    walkFunctionsInExpr(node.operand)
+
+  end
+
+  -- Number/String/Nil/True/False/Vararg/Name: nothing to recurse into
+
+end
+
+
+
+local function walkFunctionsInStat(stat)
+
+  local kind = stat.kind
+
+  if kind == "Local" or kind == "Return" then
+
+    for _, v in ipairs(stat.values or stat.args) do walkFunctionsInExpr(v) end
+
+  elseif kind == "Assign" then
+
+    for _, v in ipairs(stat.values) do walkFunctionsInExpr(v) end
+
+    for _, t in ipairs(stat.targets) do if t.kind == "Index" then walkFunctionsInExpr(t) end end
+
+  elseif kind == "ExprStat" then
+
+    walkFunctionsInExpr(stat.expr)
+
+  elseif kind == "If" then
+
+    for _, c in ipairs(stat.clauses) do walkFunctionsInExpr(c.cond) end
+
+  elseif kind == "While" then
+
+    walkFunctionsInExpr(stat.cond)
+
+  elseif kind == "Repeat" then
+
+    walkFunctionsInExpr(stat.cond)
+
+  elseif kind == "NumericFor" then
+
+    walkFunctionsInExpr(stat.start); walkFunctionsInExpr(stat.limit)
+
+    if stat.step then walkFunctionsInExpr(stat.step) end
+
+  elseif kind == "GenericFor" then
+
+    for _, e in ipairs(stat.exprs) do walkFunctionsInExpr(e) end
+
+  end
+
+end
+
+
+
+--------------------------------------------------------------------
+
+-- After recursing into a nested control-flow body (if/while/for/
+
+-- repeat/do), any name reassigned ANYWHERE inside it (at any depth,
+
+-- including inside further-nested closures, conservatively) can no
+
+-- longer be trusted to still hold its previously-tracked value once
+
+-- we're back in the straight-line run that follows. This walks the
+
+-- whole subtree collecting every `Assign` target name.
+
+--------------------------------------------------------------------
+
+
+
+function collectAssignTargetsExpr(node, into)
+
+  local kind = node.kind
+
+  if kind == "Number" or kind == "String" or kind == "Nil" or kind == "True"
+
+    or kind == "False" or kind == "Vararg" or kind == "Name" then
+
+    return
+
+  elseif kind == "Index" then
+
+    collectAssignTargetsExpr(node.obj, into); collectAssignTargetsExpr(node.key, into)
+
+  elseif kind == "Paren" then
+
+    collectAssignTargetsExpr(node.expr, into)
+
+  elseif kind == "Table" then
+
+    for _, f in ipairs(node.fields) do
+
+      if f.type == "keyed" then collectAssignTargetsExpr(f.key, into) end
+
+      collectAssignTargetsExpr(f.value, into)
+
+    end
+
+  elseif kind == "Function" then
+
+    collectAssignTargetsBlock(node.body, into)
+
+  elseif kind == "Call" then
+
+    collectAssignTargetsExpr(node.fn, into)
+
+    for _, a in ipairs(node.args) do collectAssignTargetsExpr(a, into) end
+
+  elseif kind == "MethodCall" then
+
+    collectAssignTargetsExpr(node.obj, into)
+
+    for _, a in ipairs(node.args) do collectAssignTargetsExpr(a, into) end
+
+  elseif kind == "Binop" then
+
+    collectAssignTargetsExpr(node.lhs, into); collectAssignTargetsExpr(node.rhs, into)
+
+  elseif kind == "Unop" then
+
+    collectAssignTargetsExpr(node.operand, into)
+
+  end
+
+end
+
+
+
+function collectAssignTargetsStat(stat, into)
+
+  local kind = stat.kind
+
+  if kind == "Local" then
+
+    for _, v in ipairs(stat.values) do collectAssignTargetsExpr(v, into) end
+
+  elseif kind == "LocalFunction" then
+
+    collectAssignTargetsExpr(stat.func, into)
+
+  elseif kind == "Assign" then
+
+    for _, v in ipairs(stat.values) do collectAssignTargetsExpr(v, into) end
+
+    for _, t in ipairs(stat.targets) do
+
+      if t.kind == "Name" then into[t.name] = true else collectAssignTargetsExpr(t, into) end
+
+    end
+
+  elseif kind == "ExprStat" then
+
+    collectAssignTargetsExpr(stat.expr, into)
+
+  elseif kind == "Do" then
+
+    collectAssignTargetsBlock(stat.body, into)
+
+  elseif kind == "If" then
+
+    for _, c in ipairs(stat.clauses) do
+
+      collectAssignTargetsExpr(c.cond, into)
+
+      collectAssignTargetsBlock(c.body, into)
+
+    end
+
+    if stat.elseBody then collectAssignTargetsBlock(stat.elseBody, into) end
+
+  elseif kind == "While" then
+
+    collectAssignTargetsExpr(stat.cond, into); collectAssignTargetsBlock(stat.body, into)
+
+  elseif kind == "Repeat" then
+
+    collectAssignTargetsBlock(stat.body, into); collectAssignTargetsExpr(stat.cond, into)
+
+  elseif kind == "NumericFor" then
+
+    collectAssignTargetsExpr(stat.start, into); collectAssignTargetsExpr(stat.limit, into)
+
+    if stat.step then collectAssignTargetsExpr(stat.step, into) end
+
+    collectAssignTargetsBlock(stat.body, into)
+
+  elseif kind == "GenericFor" then
+
+    for _, e in ipairs(stat.exprs) do collectAssignTargetsExpr(e, into) end
+
+    collectAssignTargetsBlock(stat.body, into)
+
+  elseif kind == "Return" then
+
+    for _, a in ipairs(stat.args) do collectAssignTargetsExpr(a, into) end
+
+  end
+
+end
+
+
+
+function collectAssignTargetsBlock(block, into)
+
+  for _, s in ipairs(block.body) do collectAssignTargetsStat(s, into) end
+
+end
+
+
+
+local function invalidateFromNested(stat, env)
+
+  local names = {}
+
+  collectAssignTargetsStat(stat, names)
+
+  for name in pairs(names) do env[name] = nil end
+
+end
+
+
+
+function optimizeBlock(block)
+
+  local env = {} -- name -> tracked pure expr, only while provably still valid
+
+  local stmts = block.body
+
+  local out = {}
+
+
+
+  for i = 1, #stmts do
+
+    local s = stmts[i]
+
+
+
+    -- Propagate known values into this statement's own expressions
+
+    -- BEFORE interpreting what it defines/invalidates.
+
+    --
+
+    -- IMPORTANT: a `while`/`repeat` condition re-evaluates on every
+
+    -- iteration, seeing whatever the body most recently assigned --
+
+    -- so it must never be substituted using a value the body itself
+
+    -- reassigns (that would freeze a loop-carried variable at its
+
+    -- pre-loop value forever, e.g. turning `while i < n` into a
+
+    -- permanently-true `while 0 < 3`). NumericFor/GenericFor's
+
+    -- start/limit/step/exprs, by contrast, really do only evaluate
+
+    -- once at loop entry, so substituting the current env there is
+
+    -- correct. Likewise every If clause's cond only ever evaluates
+
+    -- once, before this If's own body has had a chance to run.
+
+    if s.kind == "Local" then
+
+      substList(s.values, env)
+
+    elseif s.kind == "LocalFunction" then
+
+      -- name is bound before the body per Lua semantics; body is a
+
+      -- barrier anyway (handled by walkFunctionsIn / recurse below)
+
+    elseif s.kind == "Assign" then
+
+      substList(s.values, env)
+
+      for _, tgt in ipairs(s.targets) do
+
+        if tgt.kind == "Index" then
+
+          tgt.obj = substExpr(tgt.obj, env)
+
+          tgt.key = substExpr(tgt.key, env)
+
+        end
+
+      end
+
+    elseif s.kind == "ExprStat" then
+
+      s.expr = substExpr(s.expr, env)
+
+    elseif s.kind == "If" then
+
+      for _, c in ipairs(s.clauses) do c.cond = substExpr(c.cond, env) end
+
+    elseif s.kind == "While" then
+
+      local loopSafeEnv = {}
+
+      for k, v in pairs(env) do loopSafeEnv[k] = v end
+
+      local assigned = {}
+
+      collectAssignTargetsBlock(s.body, assigned)
+
+      for name in pairs(assigned) do loopSafeEnv[name] = nil end
+
+      s.cond = substExpr(s.cond, loopSafeEnv)
+
+    elseif s.kind == "NumericFor" then
+
+      s.start = substExpr(s.start, env)
+
+      s.limit = substExpr(s.limit, env)
+
+      if s.step then s.step = substExpr(s.step, env) end
+
+    elseif s.kind == "GenericFor" then
+
+      substList(s.exprs, env)
+
+    elseif s.kind == "Return" then
+
+      substList(s.args, env)
+
+    end
+
+    -- Repeat's cond is handled after recursing into its body (it can
+
+    -- read the body's own locals); Do/Break need no substitution here.
+
+
+
+    -- Now recurse into any nested block/function bodies (each gets its
+
+    -- own fresh environment -- propagation never crosses this line).
+
+    recurseIntoNestedBlocks(s)
+
+    walkFunctionsInStat(s)
+
+    if s.kind == "Repeat" then
+
+      -- Same loop-carried hazard as While: repeat's `until` condition
+
+      -- re-evaluates every iteration too, after the body has already
+
+      -- run at least once, so it must not see pre-loop values for
+
+      -- anything the body reassigns.
+
+      local loopSafeEnv = {}
+
+      for k, v in pairs(env) do loopSafeEnv[k] = v end
+
+      local assigned = {}
+
+      collectAssignTargetsBlock(s.body, assigned)
+
+      for name in pairs(assigned) do loopSafeEnv[name] = nil end
+
+      s.cond = substExpr(s.cond, loopSafeEnv)
+
+    end
+
+
+
+    -- Anything reassigned anywhere inside a nested body can no longer
+
+    -- be trusted to hold its previously-tracked value from here on.
+
+    if s.kind == "If" or s.kind == "While" or s.kind == "Repeat"
+
+      or s.kind == "NumericFor" or s.kind == "GenericFor" or s.kind == "Do" then
+
+      invalidateFromNested(s, env)
+
+    end
+
+
+
+    -- A function call anywhere in this statement could, through a
+
+    -- closure, mutate any variable that's captured anywhere in the
+
+    -- program -- even ones with no visible call between their tracked
+
+    -- definition and here. See the module banner comment for why this
+
+    -- check exists (it's fixing a real bug that was found here).
+
+    invalidateCapturedAfterCall(s, env)
+
+
+
+    -- Decide what this statement does to `env` going forward, and
+
+    -- whether a dead `local` can be eliminated.
+
+    local handled = false
+
+    if s.kind == "Local" and #s.names == 1 and #s.values <= 1 then
+
+      local name = s.names[1]
+
+      local val = s.values[1]
+
+      local isDead = not blockHasRead({ body = sliceFrom(stmts, i + 1) }, name)
+
+        and not restOfBlockCaptures(stmts, i + 1, name)
+
+
+
+      if isDead then
+
+        if val ~= nil and not isSideEffectFree(val) then
+
+          out[#out + 1] = { kind = "ExprStat", expr = val, line = s.line }
+
+        end
+
+        -- else: fully removable, no observable effect lost
+
+        handled = true
+
+      else
+
+        if val and isTrackable(val) then
+
+          env[name] = val
+
+        else
+
+          env[name] = nil
+
+        end
+
+        out[#out + 1] = s
+
+        handled = true
+
+      end
+
+    end
+
+
+
+    if not handled then
+
+      if s.kind == "Local" then
+
+        -- multi-name local decl: conservatively invalidate anything
+
+        -- these names might have shadowed/aliased, but we never track
+
+        -- multi-name decls to begin with, so nothing to invalidate.
+
+      elseif s.kind == "Assign" then
+
+        for _, tgt in ipairs(s.targets) do
+
+          if tgt.kind == "Name" then env[tgt.name] = nil end
+
+        end
+
+      end
+
+      out[#out + 1] = s
+
+    end
+
+  end
+
+
+
+  block.body = out
+
+end
+
+
+
+-- Does the name get captured by a nested Function literal anywhere
+
+-- in the given tail of statements? (A closure could read it *later*
+
+-- at call time even if no textual "read" appears to run before the
+
+-- closure is created and escapes -- treat any mention inside a nested
+
+-- Function, as either read or write, as pinning it alive.)
+
+function restOfBlockCaptures(stmts, fromIdx, name)
+
+  for i = fromIdx, #stmts do
+
+    if statMentionsInsideFunction(stmts[i], name) then return true end
+
+  end
+
+  return false
+
+end
+
+
+
+function sliceFrom(list, fromIdx)
+
+  local out = {}
+
+  for i = fromIdx, #list do out[#out + 1] = list[i] end
+
+  return out
+
+end
+
+
+
+function statMentionsInsideFunction(stat, name)
+
+  -- Reuse exprHasRead's Function-case (it already descends into
+
+  -- function bodies looking for reads); a write-only mention inside a
+
+  -- closure is rare enough, and still-conservative-safe, to fold into
+
+  -- the same "any occurrence" check via a simple textual scan.
+
+  local found = false
+
+  local function scanExpr(node)
+
+    if found or node == nil then return end
+
+    local kind = node.kind
+
+    if kind == "Function" then
+
+      -- any occurrence of `name` anywhere inside this closure's body
+
+      -- pins the outer local alive.
+
+      if blockMentionsName(node.body, name) then found = true end
+
+      return
+
+    elseif kind == "Index" then scanExpr(node.obj); scanExpr(node.key)
+
+    elseif kind == "Paren" then scanExpr(node.expr)
+
+    elseif kind == "Table" then
+
+      for _, f in ipairs(node.fields) do
+
+        if f.type == "keyed" then scanExpr(f.key) end
+
+        scanExpr(f.value)
+
+      end
+
+    elseif kind == "Call" then
+
+      scanExpr(node.fn); for _, a in ipairs(node.args) do scanExpr(a) end
+
+    elseif kind == "MethodCall" then
+
+      scanExpr(node.obj); for _, a in ipairs(node.args) do scanExpr(a) end
+
+    elseif kind == "Binop" then scanExpr(node.lhs); scanExpr(node.rhs)
+
+    elseif kind == "Unop" then scanExpr(node.operand)
+
+    end
+
+  end
+
+  local kind = stat.kind
+
+  if kind == "Local" then for _, v in ipairs(stat.values) do scanExpr(v) end
+
+  elseif kind == "LocalFunction" then scanExpr(stat.func)
+
+  elseif kind == "Assign" then
+
+    for _, v in ipairs(stat.values) do scanExpr(v) end
+
+    for _, t in ipairs(stat.targets) do if t.kind == "Index" then scanExpr(t) end end
+
+  elseif kind == "ExprStat" then scanExpr(stat.expr)
+
+  elseif kind == "Do" then found = blockMentionsName(stat.body, name)
+
+  elseif kind == "If" then
+
+    for _, c in ipairs(stat.clauses) do
+
+      scanExpr(c.cond)
+
+      if blockMentionsName(c.body, name) then found = true end
+
+    end
+
+    if stat.elseBody and blockMentionsName(stat.elseBody, name) then found = true end
+
+  elseif kind == "While" then scanExpr(stat.cond); if blockMentionsName(stat.body, name) then found = true end
+
+  elseif kind == "Repeat" then if blockMentionsName(stat.body, name) then found = true end; scanExpr(stat.cond)
+
+  elseif kind == "NumericFor" then
+
+    scanExpr(stat.start); scanExpr(stat.limit); if stat.step then scanExpr(stat.step) end
+
+    if blockMentionsName(stat.body, name) then found = true end
+
+  elseif kind == "GenericFor" then
+
+    for _, e in ipairs(stat.exprs) do scanExpr(e) end
+
+    if blockMentionsName(stat.body, name) then found = true end
+
+  elseif kind == "Return" then for _, a in ipairs(stat.args) do scanExpr(a) end
+
+  end
+
+  return found
+
+end
+
+
+
+function blockMentionsName(block, name)
+
+  for _, s in ipairs(block.body) do
+
+    if statHasRead(s, name) then return true end
+
+    if statMentionsInsideFunction(s, name) then return true end
+
+    -- also count plain reassignment targets as a mention (pins it, safest)
+
+    if s.kind == "Assign" then
+
+      for _, t in ipairs(s.targets) do
+
+        if t.kind == "Name" and t.name == name then return true end
+
+      end
+
+    end
+
+  end
+
+  return false
+
+end
+
+
+
+function SSA.apply(ast, capturedSet)
+
+  capturedNames = capturedSet or {}
+
+  optimizeBlock(ast)
+
+  return ast
+
+end
+
+
+
+return SSA
+
+xenonsec.lua
+
+#!/usr/bin/env lua
+--------------------------------------------------------------------
+-- XenonSec CLI
+--   lua xenonsec.lua <input.lua> [-o output.lua]
+--------------------------------------------------------------------
+
+local scriptDir = (debug.getinfo(1, "S").source:match("@?(.*/)") or "./")
+local Obf = dofile(scriptDir .. "obfuscate.lua")
+
+local function usage()
+  io.stderr:write([[
+XenonSec :: VM-based Lua 5.1 Obfuscator
+
+Usage:
+  lua xenonsec.lua <input.lua> [options]
+
+Options:
+  -o <file>        Output path (default: <input>.xenon.lua)
+  --no-minify      Keep the generated VM/header readable (debugging)
+  --no-fold        Disable constant folding of literal arithmetic
+  --no-localize    Disable global localization (local aliases for globals)
+  --no-ssa         Disable SSA-style value propagation / dead-store elimination
+  --no-antitamper  Disable the build-time checksum / runtime integrity check
+  --antidebug      Enable debug-hook, timing, and env-logger detection
+                   (opt-in: real false-positive risk with legitimate
+                   profilers/IDEs, so it's off by default)
+  --luau           Parse input as Luau (compound ops, continue, type
+                   annotations, if-expressions, // floor division)
+  --junk <0..1>    Junk-instruction injection rate (default 0.12, 0 disables)
+  --decoys <n>     Number of decoy constants to inject (default: randomized)
+  -h               Show this help
+
+]])
+end
+
+local args = { ... }
+if #args == 0 and arg then
+  -- Fallback for host runtimes (e.g. texlua) that only populate the
+  -- global `arg` table and don't forward CLI args through `...`.
+  local i = 1
+  while arg[i] do args[i] = arg[i]; i = i + 1 end
+end
+if #args == 0 or args[1] == "-h" or args[1] == "--help" then
+  usage()
+  os.exit(#args == 0 and 1 or 0)
+end
+
+local inputPath = args[1]
+local outputPath = nil
+local opts = {}
+local i = 2
+while i <= #args do
+  local a = args[i]
+  if a == "-o" then
+    outputPath = args[i + 1]; i = i + 2
+  elseif a == "--no-minify" then
+    opts.minify = false; i = i + 1
+  elseif a == "--no-fold" then
+    opts.fold = false; i = i + 1
+  elseif a == "--no-localize" then
+    opts.localizeGlobals = false; i = i + 1
+  elseif a == "--no-ssa" then
+    opts.ssa = false; i = i + 1
+  elseif a == "--luau" then
+    opts.luau = true; i = i + 1
+  elseif a == "--no-antitamper" then
+    opts.antiTamper = false; i = i + 1
+  elseif a == "--antidebug" then
+    opts.antiDebug = true; i = i + 1
+  elseif a == "--junk" then
+    opts.junkRate = tonumber(args[i + 1]); i = i + 2
+  elseif a == "--decoys" then
+    opts.decoyConstants = tonumber(args[i + 1]); i = i + 2
+  else
+    io.stderr:write("Unknown argument: " .. tostring(a) .. "\n")
+    os.exit(1)
+  end
+end
+
+if not outputPath then
+  outputPath = inputPath:gsub("%.lua$", "") .. ".xenon.lua"
+end
+
+local f, openErr = io.open(inputPath, "r")
+if not f then
+  io.stderr:write("Cannot open input file: " .. tostring(openErr) .. "\n")
+  os.exit(1)
+end
+local source = f:read("*a")
+f:close()
+
+local ok, result = pcall(Obf.obfuscate, source, inputPath, opts)
+if not ok then
+  io.stderr:write("XenonSec: obfuscation failed:\n  " .. tostring(result) .. "\n")
+  os.exit(1)
+end
+
+local out, writeErr = io.open(outputPath, "w")
+if not out then
+  io.stderr:write("Cannot open output file: " .. tostring(writeErr) .. "\n")
+  os.exit(1)
+end
+out:write(result)
+out:close()
+
+print("XenonSec: wrote " .. outputPath .. " (" .. #result .. " bytes)")
